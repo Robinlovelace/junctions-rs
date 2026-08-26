@@ -33,3 +33,17 @@ A separate in-process, warm benchmark used a 200-road projected star with one sh
 | Rust `junctions-core` | **0.137 ms** |
 
 That is **24.7× faster** for this narrow synthetic endpoint workload. It is not a geometry-equivalence claim: DuckDB uses GEOS buffers/dissolve/convex hull and supports its full macro policy; the Rust prototype emits a deterministic square-derived convex hull. The result proves the Rust core can outperform the current macro on a compatible hot path, not that it has replaced the production extension.
+
+## Real-data agreement (Leeds, 1 km)
+
+Both engines consumed the identical input: 3,403 Overture road segments around the University of Leeds, projected to EPSG:27700, with interior-crossing detection enabled on the Rust side (`min_arms = 3`).
+
+| Metric | Value |
+|---|---:|
+| DuckDB `junctions_cluster` junctions | 736 |
+| Rust core junctions | 891 |
+| DuckDB junctions matched within 15 m | **736 / 736 (100%)** |
+| Median match distance | **0.0 m** |
+| Unmatched Rust additions | 77 (all 3-arm) |
+
+Every DuckDB junction has a Rust counterpart at effectively identical position. The 77 additional Rust candidates share two causes worth noting: 78 DuckDB junctions absorbed more than one nearby Rust candidate under the 15 m tolerance, and Overture's fragmented segment model produces endpoint-only 3-way clusters that the DuckDB macro filters through its GEOS-based arm policy. Reconciling those candidate policies is the main parity work item before the Rust core can substitute for the extension in production.
