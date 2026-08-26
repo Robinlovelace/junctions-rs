@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import * as maplibregl from 'maplibre-gl';
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
+  import ChevronUp from '@lucide/svelte/icons/chevron-up';
+  import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   import { generate_junctions } from './lib/wasm/junctions_wasm';
 
   type Element = { type: string; id: number; geometry?: { lat: number; lon: number }[]; tags?: Record<string, string> };
@@ -20,6 +23,7 @@
   let bufferM = $state(5);
   let clusterDistanceM = $state(0.01);
   let detectIntersections = $state(true);
+  let panelOpen = $state(true);
 
   const mapStyle = 'https://tiles.openfreemap.org/styles/bright';
   const overpass = 'https://overpass-api.de/api/interpreter';
@@ -121,29 +125,46 @@
     if (!junctions) return;
     const blob = new Blob([JSON.stringify(junctions, null, 2)], { type: 'application/geo+json' });
     const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'junctions.geojson'; link.click(); URL.revokeObjectURL(link.href);
-  }
-</script>
+ }
+
+ function hidePanel() { panelOpen = false; }
+ function showPanel() { panelOpen = true; }
+ </script>
 
 <div class="app-shell">
-  <aside class="panel">
-    <div class="eyebrow">junctions-rs · WebAssembly</div>
-    <h1>Junction explorer</h1>
-    <p class="intro">Browse an area, download its OpenStreetMap road data, then detect junctions locally in your browser.</p>
-    <div class="actions">
-      <button class="primary" onclick={downloadOsm} disabled={loading}>{loading ? 'Working…' : 'Download OSM for current view'}</button>
-      <button onclick={generate} disabled={loading || !osm}>Generate junctions</button>
-      <button class="secondary" onclick={downloadJunctions} disabled={!junctions}>Download junction GeoJSON</button>
-    </div>
-    <section>
-      <h2>Detection parameters</h2>
-      <label>Minimum arms <input type="number" min="2" max="12" step="1" bind:value={minArms} /></label>
-      <label>Buffer (m) <input type="number" min="0.1" max="50" step="0.5" bind:value={bufferM} /></label>
-      <label>Cluster distance (m) <input type="number" min="0" max="10" step="0.01" bind:value={clusterDistanceM} /></label>
-      <label class="check"><input type="checkbox" bind:checked={detectIntersections} /> Detect interior crossings</label>
-    </section>
-    <p class="status">{status}</p>
-    {#if error}<p class="error" role="alert">{error}</p>{/if}
-    <p class="attribution">Basemap © OpenFreeMap contributors · Data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors · Overpass API</p>
+  <aside class:panel-hidden={!panelOpen} class="panel" id="control-panel" aria-label="Junction detection controls" aria-hidden={!panelOpen}>
+      <div class="panel-header">
+        <div>
+          <div class="eyebrow">junctions-rs · WebAssembly</div>
+          <h1>Junction explorer</h1>
+        </div>
+        <button class="panel-toggle" type="button" onclick={hidePanel} aria-expanded={panelOpen} aria-controls="control-panel" aria-label="Hide controls" title="Hide controls">
+          <ChevronDown size={20} strokeWidth={2.5} aria-hidden="true" />
+        </button>
+      </div>
+      <p class="intro">Browse an area, download its OpenStreetMap road data, then detect junctions locally in your browser.</p>
+      <div class="actions">
+        <button class="primary" onclick={downloadOsm} disabled={loading}>{loading ? 'Working…' : 'Download OSM for current view'}</button>
+        <button onclick={generate} disabled={loading || !osm}>Generate junctions</button>
+        <button class="secondary" onclick={downloadJunctions} disabled={!junctions}>Download junction GeoJSON</button>
+      </div>
+      <section>
+        <h2>Detection parameters</h2>
+        <div class="parameter-grid">
+          <label>Minimum arms <input type="number" min="2" max="12" step="1" bind:value={minArms} /></label>
+          <label>Buffer (m) <input type="number" min="0.1" max="50" step="0.5" bind:value={bufferM} /></label>
+          <label>Cluster distance (m) <input type="number" min="0" max="10" step="0.01" bind:value={clusterDistanceM} /></label>
+          <label class="check"><input type="checkbox" bind:checked={detectIntersections} /> Detect interior crossings</label>
+        </div>
+      </section>
+      <p class="status">{status}</p>
+      {#if error}<p class="error" role="alert">{error}</p>{/if}
+      <p class="attribution">Basemap © OpenFreeMap contributors · Data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors · Overpass API</p>
   </aside>
+  <button class:show-panel-hidden={panelOpen} class="show-panel" type="button" onclick={showPanel} aria-expanded={panelOpen} aria-controls="control-panel" aria-label="Show controls" title="Show controls">
+      <SlidersHorizontal size={21} strokeWidth={2.5} aria-hidden="true" />
+      <span>Controls</span>
+      <ChevronUp size={18} strokeWidth={2.5} aria-hidden="true" />
+  </button>
   <main bind:this={mapContainer} class="map"></main>
 </div>
