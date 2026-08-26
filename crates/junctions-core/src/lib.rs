@@ -6,7 +6,7 @@
 
 use geo::algorithm::bool_ops::unary_union;
 use geo::line_intersection::{LineIntersection, line_intersection};
-use geo::{Buffer, ConvexHull, Line};
+use geo::{Buffer, ConvexHull, Intersects, Line};
 use geo_types::{Coord, MultiPolygon, Point, Polygon};
 use rstar::{AABB, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,11 @@ pub struct Road {
     /// Vertical connectivity class: bridges/tunnels must use a separate level.
     #[serde(default)]
     pub level: i32,
+    /// Optional per-road buffer radius in metres. Falls back to
+    /// `Config::buffer_m`. Junctions merge when their buffers overlap, so
+    /// roads with larger radii (motorways) merge over longer distances.
+    #[serde(default)]
+    pub buffer_m: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -89,50 +94,92 @@ struct Candidate {
     level: i32,
     roads: Vec<usize>,
     node_ids: Vec<String>,
+    buffer_m: f64,
 }
 
-/// Find same-level endpoint and interior-crossing junctions in projected roads.
+/// Find same-level junctions in projected roads.
 ///
-/// This is intentionally deterministic: output IDs are sorted by level, y then x.
-/// Input road geometry must be in a local projected CRS in metres.
+/// Junctions are the connected components of the union of per-node circular
+/// buffers: every candidate node (road endpoint or interior crossing) with at
+/// least `min_arms` incident road ends is buffered at its road's radius, all
+/// buffers on one level are dissolved, and each connected component becomes
+/// one junction polygon (its convex hull). This matches the GEOS
+/// `ST_Union_Agg(ST_Buffer(...))` semantics of `junctions_cluster`, so nearby
+/// junctions whose buffers overlap merge into a single junction system.
+///
+/// This is intentionally deterministic: output IDs are sorted by level, y then
+/// x. Input road geometry must be in a local projected CRS in metres.
 pub fn find_junctions(roads: &[Road], config: Config) -> Result<Vec<Junction>, JunctionError> {
     validate(roads, config)?;
-    let mut candidates = endpoint_candidates(roads);
+    let mut candidates = endpoint_candidates(roads, config.buffer_m);
     if config.detect_intersections {
-        candidates.extend(intersection_candidates(roads));
+        candidates.extend(intersection_candidates(roads, config.buffer_m));
     }
-    let mut clusters = cluster_candidates(candidates, config.cluster_distance_m);
-    let mut result = Vec::new();
+    let positions = snap_positions(candidates, config.cluster_distance_m);
 
-    for cluster in &mut clusters {
-        cluster.roads.sort_unstable();
-        cluster.roads.dedup();
-        let arm_count = cluster.roads.len();
-        if arm_count < config.min_arms {
+    let mut result = Vec::new();
+    let mut levels: Vec<i32> = positions.iter().map(|p| p.level).collect();
+    levels.sort_unstable();
+    levels.dedup();
+
+    for level in levels {
+        let qualifying: Vec<&Position> = positions
+            .iter()
+            .filter(|p| p.level == level && p.incidence >= config.min_arms)
+            .collect();
+        if qualifying.is_empty() {
             continue;
         }
-        let center = centroid(&cluster.points);
-        cluster.node_ids.sort();
-        cluster.node_ids.dedup();
-        let mut way_ids = cluster
-            .roads
+        let buffers: Vec<MultiPolygon<f64>> = qualifying
             .iter()
-            .map(|index| roads[*index].id.clone())
-            .collect::<Vec<_>>();
-        way_ids.sort();
-        way_ids.dedup();
-        let polygons = dissolved_buffers(&cluster.points, config.buffer_m);
-        result.push(Junction {
-            id: stable_junction_id(cluster.level, &cluster.node_ids, &way_ids, &cluster.points),
-            level: cluster.level,
-            x: center.x,
-            y: center.y,
-            num_nodes: cluster.points.len(),
-            num_arms: arm_count,
-            node_ids: cluster.node_ids.clone(),
-            way_ids,
-            polygons,
-        });
+            .copied()
+            .map(|p| Point::new(p.point.x, p.point.y).buffer(p.buffer_m))
+            .collect();
+        let dissolved = unary_union(buffers.iter());
+        for component in &dissolved.0 {
+            let members: Vec<&Position> = qualifying
+                .iter()
+                .copied()
+                .filter(|p| component.intersects(&Point::new(p.point.x, p.point.y)))
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let mut road_indices = members
+                .iter()
+                .flat_map(|p| p.roads.iter().copied())
+                .collect::<Vec<_>>();
+            road_indices.sort_unstable();
+            road_indices.dedup();
+            if road_indices.len() < config.min_arms {
+                continue;
+            }
+            let mut node_ids = members
+                .iter()
+                .flat_map(|p| p.node_ids.iter().cloned())
+                .collect::<Vec<_>>();
+            node_ids.sort();
+            node_ids.dedup();
+            let points = members.iter().map(|p| p.point).collect::<Vec<_>>();
+            let mut way_ids = road_indices
+                .iter()
+                .map(|index| roads[*index].id.clone())
+                .collect::<Vec<_>>();
+            way_ids.sort();
+            way_ids.dedup();
+            let polygons = vec![polygon_coordinates(&component.convex_hull())];
+            result.push(Junction {
+                id: stable_junction_id(level, &node_ids, &way_ids, &points),
+                level,
+                x: centroid(&points).x,
+                y: centroid(&points).y,
+                num_nodes: points.len(),
+                num_arms: road_indices.len(),
+                node_ids,
+                way_ids,
+                polygons,
+            });
+        }
     }
     result.sort_by(|a, b| {
         a.level
@@ -162,11 +209,16 @@ fn validate(roads: &[Road], config: Config) -> Result<(), JunctionError> {
                 id: road.id.clone(),
             });
         }
+        if let Some(buffer) = road.buffer_m {
+            if !buffer.is_finite() || buffer < 0.0 {
+                return Err(JunctionError::InvalidConfig);
+            }
+        }
     }
     Ok(())
 }
 
-fn endpoint_candidates(roads: &[Road]) -> Vec<Candidate> {
+fn endpoint_candidates(roads: &[Road], default_buffer: f64) -> Vec<Candidate> {
     let mut out = Vec::with_capacity(roads.len() * 2);
     for (road_index, road) in roads.iter().enumerate() {
         for coordinate_index in [0, road.coordinates.len() - 1] {
@@ -181,6 +233,7 @@ fn endpoint_candidates(roads: &[Road]) -> Vec<Candidate> {
                     .cloned()
                     .into_iter()
                     .collect(),
+                buffer_m: road.buffer_m.unwrap_or(default_buffer),
             });
         }
     }
@@ -213,7 +266,7 @@ fn road_envelope(coordinates: &[[f64; 2]]) -> AABB<[f64; 2]> {
     AABB::from_corners(min, max)
 }
 
-fn intersection_candidates(roads: &[Road]) -> Vec<Candidate> {
+fn intersection_candidates(roads: &[Road], default_buffer: f64) -> Vec<Candidate> {
     let entries: Vec<RoadEntry> = roads
         .iter()
         .enumerate()
@@ -246,11 +299,14 @@ fn intersection_candidates(roads: &[Road]) -> Vec<Candidate> {
                     if let Some(LineIntersection::SinglePoint { intersection, .. }) =
                         line_intersection(left_line, right_line)
                     {
+                        let left_buffer = left.buffer_m.unwrap_or(default_buffer);
+                        let right_buffer = right.buffer_m.unwrap_or(default_buffer);
                         out.push(Candidate {
                             point: intersection,
                             level: left.level,
                             roads: vec![left_index, right_index],
                             node_ids: Vec::new(),
+                            buffer_m: left_buffer.min(right_buffer),
                         });
                     }
                 }
@@ -261,22 +317,27 @@ fn intersection_candidates(roads: &[Road]) -> Vec<Candidate> {
 }
 
 #[derive(Debug)]
-struct Cluster {
+struct Position {
     level: i32,
-    points: Vec<Coord<f64>>,
+    point: Coord<f64>,
     roads: Vec<usize>,
     node_ids: Vec<String>,
+    /// Number of road-end incidences at this position (endpoints count one
+    /// each; an interior crossing counts the number of crossing roads).
+    incidence: usize,
+    /// Buffer radius in metres for this position: the minimum over its roads.
+    buffer_m: f64,
 }
 
-/// R-tree key over every accepted candidate position, so a new candidate can
-/// find its cluster without scanning all clusters.
-struct ClusterEntry {
-    cluster_index: usize,
+/// R-tree key over every accepted position, so a new candidate can find its
+/// snapped position without scanning all positions.
+struct PositionEntry {
+    position_index: usize,
     level: i32,
     point: Coord<f64>,
 }
 
-impl RTreeObject for ClusterEntry {
+impl RTreeObject for PositionEntry {
     type Envelope = AABB<[f64; 2]>;
 
     fn envelope(&self) -> Self::Envelope {
@@ -284,15 +345,20 @@ impl RTreeObject for ClusterEntry {
     }
 }
 
-fn cluster_candidates(mut candidates: Vec<Candidate>, distance: f64) -> Vec<Cluster> {
+/// Group candidates by snapped position: candidates closer than `distance`
+/// (default 1 cm) at the same level share one position. Each position keeps
+/// the union of its roads/node ids, the summed incidence, and the minimum
+/// buffer radius of its roads (matching the reference implementations, which
+/// buffer a node at the minimum class radius of its incident links).
+fn snap_positions(mut candidates: Vec<Candidate>, distance: f64) -> Vec<Position> {
     candidates.sort_by(|a, b| {
         a.level
             .cmp(&b.level)
             .then_with(|| a.point.y.total_cmp(&b.point.y))
             .then_with(|| a.point.x.total_cmp(&b.point.x))
     });
-    let mut clusters: Vec<Cluster> = Vec::new();
-    let mut entries: RTree<ClusterEntry> = RTree::new();
+    let mut positions: Vec<Position> = Vec::new();
+    let mut entries: RTree<PositionEntry> = RTree::new();
     let tolerance = distance * distance + EPSILON;
     'candidate: for candidate in candidates {
         let query = AABB::from_corners(
@@ -308,34 +374,46 @@ fn cluster_candidates(mut candidates: Vec<Candidate>, distance: f64) -> Vec<Clus
             if squared_distance(entry.point, candidate.point) > tolerance {
                 continue;
             }
-            target = Some(entry.cluster_index);
+            target = Some(entry.position_index);
             break;
         }
-        if let Some(cluster_index) = target {
-            clusters[cluster_index].points.push(candidate.point);
-            clusters[cluster_index].roads.extend(candidate.roads);
-            clusters[cluster_index].node_ids.extend(candidate.node_ids);
-            entries.insert(ClusterEntry {
-                cluster_index,
+        if let Some(position_index) = target {
+            let position = &mut positions[position_index];
+            position.point = midpoint(position.point, candidate.point);
+            position.incidence += candidate.roads.len();
+            position.roads.extend(candidate.roads);
+            position.node_ids.extend(candidate.node_ids);
+            position.buffer_m = position.buffer_m.min(candidate.buffer_m);
+            entries.insert(PositionEntry {
+                position_index,
                 level: candidate.level,
-                point: candidate.point,
+                point: position.point,
             });
             continue 'candidate;
         }
-        let cluster_index = clusters.len();
-        clusters.push(Cluster {
+        let position_index = positions.len();
+        positions.push(Position {
             level: candidate.level,
-            points: vec![candidate.point],
+            point: candidate.point,
+            incidence: candidate.roads.len(),
             roads: candidate.roads,
             node_ids: candidate.node_ids,
+            buffer_m: candidate.buffer_m,
         });
-        entries.insert(ClusterEntry {
-            cluster_index,
+        entries.insert(PositionEntry {
+            position_index,
             level: candidate.level,
             point: candidate.point,
         });
     }
-    clusters
+    positions
+}
+
+fn midpoint(a: Coord<f64>, b: Coord<f64>) -> Coord<f64> {
+    Coord {
+        x: (a.x + b.x) / 2.0,
+        y: (a.y + b.y) / 2.0,
+    }
 }
 
 fn squared_distance(a: Coord<f64>, b: Coord<f64>) -> f64 {
@@ -348,19 +426,6 @@ fn centroid(points: &[Coord<f64>]) -> Coord<f64> {
         x: points.iter().map(|p| p.x).sum::<f64>() / count,
         y: points.iter().map(|p| p.y).sum::<f64>() / count,
     }
-}
-
-fn dissolved_buffers(points: &[Coord<f64>], buffer: f64) -> Vec<Vec<Vec<[f64; 2]>>> {
-    let buffers: Vec<MultiPolygon<f64>> = points
-        .iter()
-        .map(|point| Point::new(point.x, point.y).buffer(buffer))
-        .collect();
-    let dissolved = unary_union(buffers.iter());
-    dissolved
-        .0
-        .iter()
-        .map(|polygon| polygon_coordinates(&polygon.convex_hull()))
-        .collect()
 }
 
 fn polygon_coordinates(polygon: &Polygon<f64>) -> Vec<Vec<[f64; 2]>> {
@@ -412,15 +477,37 @@ mod tests {
             coordinates,
             node_ids: Vec::new(),
             level,
+            buffer_m: None,
         }
     }
 
     #[test]
-    fn dissolves_touching_round_point_buffers() {
-        let polygons =
-            dissolved_buffers(&[Coord { x: 0.0, y: 0.0 }, Coord { x: 8.0, y: 0.0 }], 5.0);
-        assert_eq!(polygons.len(), 1, "overlapping circles must dissolve");
-        let ring = &polygons[0][0];
+    fn merges_overlapping_buffer_junctions_into_one() {
+        // Two 2-arm junctions 8 m apart: 5 m buffers overlap, so the dissolved
+        // union produces ONE junction polygon spanning both nodes.
+        let roads = vec![
+            road("a", vec![[-10., 0.], [0., 0.]], 0),
+            road("b", vec![[0., 0.], [10., 0.]], 0),
+            road("c", vec![[8., -10.], [8., 0.]], 0),
+            road("d", vec![[8., 0.], [8., 10.]], 0),
+        ];
+        let found = find_junctions(
+            &roads,
+            Config {
+                min_arms: 2,
+                buffer_m: 5.0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "overlapping buffers must dissolve into one junction"
+        );
+        assert_eq!(found[0].num_arms, 4);
+        assert_eq!(found[0].num_nodes, 2);
+        let ring = &found[0].polygons[0][0];
         assert!(
             ring.len() > 8,
             "a round buffer needs more than square corners"
@@ -430,10 +517,50 @@ mod tests {
     }
 
     #[test]
-    fn retains_disconnected_buffers_as_multipolygon_parts() {
-        let polygons =
-            dissolved_buffers(&[Coord { x: 0.0, y: 0.0 }, Coord { x: 11.0, y: 0.0 }], 5.0);
-        assert_eq!(polygons.len(), 2, "separate circles must not be bridged");
+    fn keeps_disjoint_buffer_junctions_separate() {
+        // Same as above but 11 m apart: 5 m buffers do not overlap, so two
+        // separate junction polygons result.
+        let roads = vec![
+            road("a", vec![[-10., 0.], [0., 0.]], 0),
+            road("b", vec![[0., 0.], [10., 0.]], 0),
+            road("c", vec![[11., -10.], [11., 0.]], 0),
+            road("d", vec![[11., 0.], [11., 10.]], 0),
+        ];
+        let found = find_junctions(
+            &roads,
+            Config {
+                min_arms: 2,
+                buffer_m: 5.0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(found.len(), 2, "separate circles must not be bridged");
+    }
+
+    #[test]
+    fn respects_per_road_buffer_radii() {
+        // A motorway (20 m) and a minor road (5 m) meet: the node buffers at
+        // the minimum class radius (5 m), matching junctions_cluster's
+        // min(CASE ...) semantics, so the junction hull stays small.
+        let mut motorway = road("m", vec![[-10., 0.], [0., 0.]], 0);
+        motorway.buffer_m = Some(20.0);
+        let roads = vec![
+            motorway,
+            road("minor-a", vec![[0., 0.], [10., 0.]], 0),
+            road("minor-b", vec![[0., 0.], [0., 10.]], 0),
+        ];
+        let found = find_junctions(&roads, Config::default()).unwrap();
+        assert_eq!(found.len(), 1);
+        let ring = &found[0].polygons[0][0];
+        let extent = ring
+            .iter()
+            .map(|point| (point[0].powi(2) + point[1].powi(2)).sqrt())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            extent < 5.6,
+            "junction must buffer at the minimum radius, got {extent:.2} m"
+        );
     }
 
     #[test]

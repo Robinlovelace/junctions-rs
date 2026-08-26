@@ -14,12 +14,21 @@
 
 ## Geometry and identifiers
 
-The core creates a round planar buffer for each accepted candidate node, performs
-a batched unary union, then takes a convex hull for each dissolved component.
-This matches the `ST_Buffer` → `ST_Union_Agg` → `ST_Dump` → `ST_ConvexHull`
-footprint sequence used by DuckDB `junctions_cluster`, while remaining pure Rust
-and WASM-compatible. Output is always represented as GeoJSON-compatible
+The core creates a round planar buffer for every accepted candidate node
+(road endpoint or interior crossing) at its road's radius, dissolves all
+buffers on one level with a batched unary union, and takes a convex hull for
+each connected component. A component is one junction system: nearby nodes
+whose buffers overlap merge into a single junction polygon. This matches the
+`ST_Buffer` → `ST_Union_Agg` → `ST_Dump` → `ST_ConvexHull` footprint sequence
+used by DuckDB `junctions_cluster`, while remaining pure Rust and
+WASM-compatible. Output is always represented as GeoJSON-compatible
 MultiPolygon coordinates so disconnected components are never falsely bridged.
+
+Buffer radii: a road may carry its own `buffer_m` (e.g. road-class radii from
+OS Open Roads); a node buffers at the minimum radius of its incident roads,
+and candidate positions are snapped with `cluster_distance_m` (1 cm) before
+buffering. Only nodes with at least `min_arms` incident road ends are
+buffered, so dead ends never inflate a neighbouring junction.
 
 When aligned `Road.node_ids` are available, a junction ID is a length-prefixed,
 collision-free canonical combination of its level plus sorted, deduplicated

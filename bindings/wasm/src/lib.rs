@@ -1,4 +1,4 @@
-use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, BinaryArray, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow_ipc::reader::StreamReader;
 use geo_types::Geometry;
 use geozero::{ToGeo, wkb::Wkb};
@@ -71,6 +71,9 @@ fn append_roads(batch: &RecordBatch, roads: &mut Vec<Road>) -> Result<(), String
     let ids = column::<StringArray>(batch, "id")?;
     let geometries = column::<BinaryArray>(batch, "geometry")?;
     let levels = column::<Int32Array>(batch, "level")?;
+    let buffers = batch
+        .column_by_name("buffer_m")
+        .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
     for row in 0..batch.num_rows() {
         if ids.is_null(row) || geometries.is_null(row) || levels.is_null(row) {
             return Err(format!(
@@ -91,6 +94,7 @@ fn append_roads(batch: &RecordBatch, roads: &mut Vec<Road>) -> Result<(), String
             coordinates: line.0.into_iter().map(|coord| [coord.x, coord.y]).collect(),
             node_ids: Vec::new(),
             level: levels.value(row),
+            buffer_m: buffers.and_then(|b| (!b.is_null(row)).then(|| b.value(row))),
         });
     }
     Ok(())

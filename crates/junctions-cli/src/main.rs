@@ -165,5 +165,8 @@ fn feature_to_road((index, feature): (usize, &Feature)) -> Result<Road> {
         coordinates,
         node_ids,
         level,
+        buffer_m: props
+            .and_then(|p| p.get("buffer_m"))
+            .and_then(JsonValue::as_f64),
     })
 }
