@@ -47,16 +47,24 @@
 
   const mapStyle = 'https://tiles.openfreemap.org/styles/bright';
   const overpass = 'https://overpass-api.de/api/interpreter';
+  /** Default view: University of Leeds campus with a ~200 m window. */
+  const DEFAULT_VIEW: Origin = { lon: -1.556, lat: 53.808 };
+  const DEFAULT_WINDOW_M = 200;
 
-  function initialView(): { center: [number, number]; zoom: number } {
+  function initialView(): { center: [number, number]; zoom: number; fromUrl: boolean } {
     const params = new URLSearchParams(window.location.search);
-    const lat = Number(params.get('lat'));
-    const lng = Number(params.get('lng'));
-    const zoom = Number(params.get('z'));
+    // Number(null) is 0, so missing params must yield NaN, not a phantom (0, 0).
+    const param = (name: string): number => {
+      const value = params.get(name);
+      return value === null ? NaN : Number(value);
+    };
+    const lat = param('lat');
+    const lng = param('lng');
+    const zoom = param('z');
     if (Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
-      return { center: [lng, lat], zoom: Number.isFinite(zoom) ? Math.min(Math.max(zoom, 2), 19) : 15 };
+      return { center: [lng, lat], zoom: Number.isFinite(zoom) ? Math.min(Math.max(zoom, 2), 19) : 15, fromUrl: true };
     }
-    return { center: [origin.lon, origin.lat], zoom: 13 };
+    return { center: [DEFAULT_VIEW.lon, DEFAULT_VIEW.lat], zoom: 17.5, fromUrl: false };
   }
 
   onMount(() => {
@@ -65,7 +73,19 @@
     map = new maplibregl.Map({ container: mapContainer, style: mapStyle, center: view.center, zoom: view.zoom });
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }));
-    map.on('load', () => addSources());
+    map.on('load', () => {
+      addSources();
+      if (!view.fromUrl) {
+        // Fit a ~200 m window around the default centre, whatever the canvas size.
+        const half = DEFAULT_WINDOW_M / 2;
+        const dLon = half / (111320 * Math.cos((view.center[1] * Math.PI) / 180));
+        const dLat = half / 110574;
+        map!.fitBounds(
+          [[view.center[0] - dLon, view.center[1] - dLat], [view.center[0] + dLon, view.center[1] + dLat]],
+          { duration: 0 }
+        );
+      }
+    });
     return () => map?.remove();
   });
 
