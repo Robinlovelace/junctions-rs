@@ -6,12 +6,19 @@
   import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   import proj4 from 'proj4';
   import { loadOvertureRoads } from './lib/overture';
+  import { parseOsmPbf } from './lib/pbf';
+  import { BUFFER_PRESETS, bufferForTags } from './lib/roadClasses';
   import { generate_junctions, generate_junctions_arrow } from './lib/wasm/junctions_wasm';
 
   type Element = { type: string; id: number; nodes?: number[]; geometry?: { lat: number; lon: number }[]; tags?: Record<string, string> };
   type OsmResponse = { elements: Element[] };
-  type Road = { id: string; coordinates: [number, number][]; node_ids: string[]; level: number };
+  type Road = { id: string; coordinates: [number, number][]; node_ids: string[]; level: number; buffer_m?: number };
   type Origin = { lon: number; lat: number };
+
+  // Mirror of the example-leeds-station-200m release asset, committed to the
+  // repo so it is served with CORS headers (GitHub release assets are not).
+  const EXAMPLE_ASSET = 'https://raw.githubusercontent.com/Robinlovelace/junctions-rs/main/data/examples/leeds-station-200m.osm.pbf';
+  const EXAMPLE_CENTER: Origin = { lon: -1.5474, lat: 53.795 };
 
   let mapContainer: HTMLElement;
   let map = $state<maplibregl.Map | null>(null);
@@ -31,9 +38,12 @@
   let loading = $state(false);
   let minArms = $state(3);
   let bufferM = $state(5);
+  let bufferPresetIndex = $state(0);
   let clusterDistanceM = $state(0.01);
   let detectIntersections = $state(true);
   let panelOpen = $state(true);
+  /** OSM tags per road id, so a buffer-preset change can re-derive radii. */
+  let roadTags = $state<Record<string, Record<string, string>>>({});
 
   const mapStyle = 'https://tiles.openfreemap.org/styles/bright';
   const overpass = 'https://overpass-api.de/api/interpreter';
@@ -71,12 +81,76 @@
   function emptyCollection(): GeoJSON.FeatureCollection { return { type: 'FeatureCollection', features: [] }; }
 
   function normalizeRoads(osm: OsmResponse): Road[] {
-    return osm.elements.filter((e) => e.type === 'way' && e.geometry && e.geometry.length >= 2).map((e) => ({
-      id: String(e.id),
-      coordinates: e.geometry!.map((p) => project([p.lon, p.lat])),
-      node_ids: (e.nodes ?? []).map(String),
-      level: roadLevel(e.tags ?? {})
-    }));
+    const preset = BUFFER_PRESETS[bufferPresetIndex];
+    const result: Road[] = [];
+    roadTags = {};
+    for (const e of osm.elements) {
+      if (e.type !== 'way' || !e.geometry || e.geometry.length < 2) continue;
+      const tags = e.tags ?? {};
+      roadTags[String(e.id)] = tags;
+      result.push({
+        id: String(e.id),
+        coordinates: e.geometry!.map((p) => project([p.lon, p.lat])),
+        node_ids: (e.nodes ?? []).map(String),
+        level: roadLevel(tags),
+        buffer_m: bufferForTags(preset, tags)
+      });
+    }
+    return result;
+  }
+
+  /** Re-apply the selected buffer preset to in-memory roads (live for Generate). */
+  function applyBufferPreset() {
+    const preset = BUFFER_PRESETS[bufferPresetIndex];
+    bufferM = preset.fallback;
+    roads = roads.map((road) => ({ ...road, buffer_m: bufferForTags(preset, roadTags[road.id] ?? {}) }));
+    if (roads.length > 0) status = `Re-applied "${preset.name}" buffers to ${roads.length.toLocaleString()} road ways. Click Generate junctions.`;
+  }
+
+  async function loadExample() {
+    if (!map) return;
+    loading = true; error = ''; junctions = null;
+    status = 'Downloading the Leeds station example PBF…';
+    try {
+      origin = EXAMPLE_CENTER;
+      map.flyTo({ center: [EXAMPLE_CENTER.lon, EXAMPLE_CENTER.lat], zoom: 16, duration: 800 });
+      const response = await fetch(EXAMPLE_ASSET);
+      if (!response.ok) throw new Error(`Example data request returned HTTP ${response.status}`);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      status = 'Parsing the OSM PBF in the browser…';
+      const { nodes, ways } = await parseOsmPbf(bytes);
+      const preset = BUFFER_PRESETS[bufferPresetIndex];
+      const result: Road[] = [];
+      roadTags = {};
+      for (const way of ways) {
+        if (!way.tags.highway || way.tags.highway === 'construction' || way.tags.highway === 'corridor') continue;
+        const coordinates: [number, number][] = [];
+        const nodeIds: string[] = [];
+        for (const ref of way.refs) {
+          const coord = nodes.get(ref);
+          if (!coord) continue;
+          coordinates.push(project(coord));
+          nodeIds.push(String(ref));
+        }
+        if (coordinates.length < 2) continue;
+        const tags = way.tags;
+        roadTags[String(way.id)] = tags;
+        result.push({
+          id: String(way.id),
+          coordinates,
+          node_ids: nodeIds,
+          level: roadLevel(tags),
+          buffer_m: bufferForTags(preset, tags)
+        });
+      }
+      roads = result;
+      overtureArrowIpc = null;
+      detectorCrs = 'local';
+      hasRoadData = roads.length > 0;
+      setSource('roads', roadsGeoJson());
+      status = `Loaded ${roads.length.toLocaleString()} example road ways (200 m around Leeds station) from the release PBF. Click Generate junctions.`;
+    } catch (reason) { error = reason instanceof Error ? reason.message : String(reason); status = 'Example data load failed.'; }
+    finally { loading = false; }
   }
 
   function roadLevel(tags: Record<string, string>): number {
@@ -227,6 +301,7 @@
       <p class="intro">Browse an area, get OpenStreetMap road data into browser memory, then detect junctions locally. Overture Maps GeoParquet is available for larger areas.</p>
       <div class="actions">
         <button class="primary" onclick={downloadOsm} disabled={loading}>{loading ? 'Working…' : 'Get OSM data'}</button>
+        <button onclick={loadExample} disabled={loading}>Use example data</button>
         <button onclick={getOvertureRoads} disabled={loading}>Get Overture roads</button>
         <button onclick={generate} disabled={loading || !hasRoadData}>Generate junctions</button>
         <button class="secondary" onclick={downloadJunctions} disabled={!junctions}>Download junction GeoJSON</button>
@@ -234,8 +309,15 @@
       <section>
         <h2>Detection parameters</h2>
         <div class="parameter-grid">
+          <label>Buffer size by road class
+            <select bind:value={bufferPresetIndex} onchange={applyBufferPreset}>
+              {#each BUFFER_PRESETS as preset, index (preset.name)}
+                <option value={index}>{preset.name}</option>
+              {/each}
+            </select>
+          </label>
+          <label>Fallback buffer (m) <input type="number" min="0.1" max="50" step="0.5" bind:value={bufferM} /></label>
           <label>Minimum arms <input type="number" min="2" max="12" step="1" bind:value={minArms} /></label>
-          <label>Buffer (m) <input type="number" min="0.1" max="50" step="0.5" bind:value={bufferM} /></label>
           <label>Cluster distance (m) <input type="number" min="0" max="10" step="0.01" bind:value={clusterDistanceM} /></label>
           <label class="check"><input type="checkbox" bind:checked={detectIntersections} /> Detect interior crossings</label>
         </div>
