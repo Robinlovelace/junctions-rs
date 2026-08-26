@@ -7,9 +7,9 @@
 junctions_json(roads_json, buffer_m, min_arms, cluster_distance_m)
 }
 \arguments{
-\item{roads_json}{A JSON array of \verb{\{id, coordinates, level\}} roads.}
+\item{roads_json}{A JSON array of \verb{\{id, coordinates, node_ids, level\}} roads.}
 
-\item{buffer_m}{Polygon half-width in projected metres.}
+\item{buffer_m}{Radius of round point buffers in projected metres.}
 
 \item{min_arms}{Minimum contributing-road count.}
 

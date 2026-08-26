@@ -97,18 +97,25 @@ fn junction_feature(junction: junctions_core::Junction) -> Feature {
     properties.insert("level".into(), json!(junction.level));
     properties.insert("num_nodes".into(), json!(junction.num_nodes));
     properties.insert("num_arms".into(), json!(junction.num_arms));
+    properties.insert("node_ids".into(), json!(junction.node_ids));
+    properties.insert("way_ids".into(), json!(junction.way_ids));
     Feature {
         bbox: None,
         id: None,
         foreign_members: None,
         properties: Some(properties),
-        geometry: Some(Geometry::new(Value::Polygon(vec![
+        geometry: Some(Geometry::new(Value::MultiPolygon(
             junction
-                .polygon
+                .polygons
                 .into_iter()
-                .map(|point| point.to_vec())
+                .map(|polygon| {
+                    polygon
+                        .into_iter()
+                        .map(|ring| ring.into_iter().map(|point| point.to_vec()).collect())
+                        .collect()
+                })
                 .collect(),
-        ]))),
+        ))),
     }
 }
 
@@ -139,9 +146,24 @@ fn feature_to_road((index, feature): (usize, &Feature)) -> Result<Road> {
         .and_then(|p| p.get("level"))
         .and_then(JsonValue::as_i64)
         .unwrap_or(0) as i32;
+    let node_ids = props
+        .and_then(|p| p.get("node_ids").or_else(|| p.get("nodes")))
+        .and_then(JsonValue::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| {
+                    node.as_str()
+                        .map(str::to_owned)
+                        .or_else(|| node.as_i64().map(|id| id.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(Road {
         id,
         coordinates,
+        node_ids,
         level,
     })
 }

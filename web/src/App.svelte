@@ -4,19 +4,27 @@
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
-  import { generate_junctions } from './lib/wasm/junctions_wasm';
+  import proj4 from 'proj4';
+  import { loadOvertureRoads } from './lib/overture';
+  import { generate_junctions, generate_junctions_arrow } from './lib/wasm/junctions_wasm';
 
-  type Element = { type: string; id: number; geometry?: { lat: number; lon: number }[]; tags?: Record<string, string> };
+  type Element = { type: string; id: number; nodes?: number[]; geometry?: { lat: number; lon: number }[]; tags?: Record<string, string> };
   type OsmResponse = { elements: Element[] };
-  type Road = { id: string; coordinates: [number, number][]; level: number };
+  type Road = { id: string; coordinates: [number, number][]; node_ids: string[]; level: number };
   type Origin = { lon: number; lat: number };
 
   let mapContainer: HTMLElement;
   let map = $state<maplibregl.Map | null>(null);
   let origin = $state<Origin>({ lon: -1.555, lat: 53.8067 });
-  let osm = $state<OsmResponse | null>(null);
+  // Retain only the fields the detector and map require. The raw Overpass
+  // response contains tags, wrappers, and WGS84 geometry that are not needed
+  // after this normalization step.
+  let roads = $state.raw<Road[]>([]);
+  let overtureArrowIpc = $state.raw<Uint8Array | null>(null);
+  let detectorCrs = $state<'local' | 'bng'>('local');
+  let hasRoadData = $state(false);
   let junctions = $state<GeoJSON.FeatureCollection | null>(null);
-  let status = $state('Pan or zoom to an area, then download OSM data.');
+  let status = $state('Pan or zoom to an area, then get OSM data.');
   let error = $state('');
   let loading = $state(false);
   let minArms = $state(3);
@@ -27,6 +35,7 @@
 
   const mapStyle = 'https://tiles.openfreemap.org/styles/bright';
   const overpass = 'https://overpass-api.de/api/interpreter';
+  proj4.defs('EPSG:27700', '+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +datum=OSGB36 +units=m +no_defs');
 
   onMount(() => {
     map = new maplibregl.Map({ container: mapContainer, style: mapStyle, center: [origin.lon, origin.lat], zoom: 13 });
@@ -47,10 +56,11 @@
 
   function emptyCollection(): GeoJSON.FeatureCollection { return { type: 'FeatureCollection', features: [] }; }
 
-  function getRoads(): Road[] {
-    return (osm?.elements ?? []).filter((e) => e.type === 'way' && e.geometry && e.geometry.length >= 2).map((e) => ({
+  function normalizeRoads(osm: OsmResponse): Road[] {
+    return osm.elements.filter((e) => e.type === 'way' && e.geometry && e.geometry.length >= 2).map((e) => ({
       id: String(e.id),
       coordinates: e.geometry!.map((p) => project([p.lon, p.lat])),
+      node_ids: (e.nodes ?? []).map(String),
       level: roadLevel(e.tags ?? {})
     }));
   }
@@ -76,7 +86,7 @@
   }
 
   function roadsGeoJson(): GeoJSON.FeatureCollection {
-    return { type: 'FeatureCollection', features: getRoads().map((road) => ({ type: 'Feature', properties: { id: road.id, level: road.level }, geometry: { type: 'LineString', coordinates: road.coordinates } })) };
+    return { type: 'FeatureCollection', features: roads.map((road) => ({ type: 'Feature', properties: { id: road.id, level: road.level }, geometry: { type: 'LineString', coordinates: road.coordinates } })) };
   }
 
   function setSource(id: string, data: GeoJSON.GeoJSON) {
@@ -87,33 +97,60 @@
   async function downloadOsm() {
     if (!map) return;
     const zoom = map.getZoom();
-    if (zoom < 12) { error = 'Zoom in to level 12 or closer before downloading (keeps the public API request small).'; return; }
-    loading = true; error = ''; junctions = null; status = 'Downloading OSM data from Overpass…';
+    if (zoom < 12) { error = 'Zoom in to level 12 or closer before getting data (keeps the public API request small).'; return; }
+    loading = true; error = ''; junctions = null; status = 'Getting OSM data from Overpass…';
     try {
       const bounds = map.getBounds();
       const [west, south] = [bounds.getWest(), bounds.getSouth()];
       const [east, north] = [bounds.getEast(), bounds.getNorth()];
       origin = { lon: (west + east) / 2, lat: (south + north) / 2 };
-      const query = `[out:json][timeout:60];way[highway](${south},${west},${north},${east});out geom;`;
+      const query = `[out:json][timeout:60];way[highway](${south},${west},${north},${east});out body geom;`;
       const response = await fetch(`${overpass}?data=${encodeURIComponent(query)}`);
       if (!response.ok) throw new Error(`Overpass returned HTTP ${response.status}`);
-      osm = await response.json() as OsmResponse;
+      roads = normalizeRoads(await response.json() as OsmResponse);
+      overtureArrowIpc = null;
+      detectorCrs = 'local';
+      hasRoadData = roads.length > 0;
       setSource('roads', roadsGeoJson());
-      status = `Downloaded ${getRoads().length.toLocaleString()} road ways. Click Generate junctions.`;
-      const blob = new Blob([JSON.stringify(osm, null, 2)], { type: 'application/json' });
-      const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'osm-data-overpass.json'; link.click(); URL.revokeObjectURL(link.href);
-    } catch (reason) { error = reason instanceof Error ? reason.message : String(reason); status = 'Download failed.'; }
+      status = `Loaded ${roads.length.toLocaleString()} road ways in browser memory. Click Generate junctions.`;
+    } catch (reason) { error = reason instanceof Error ? reason.message : String(reason); status = 'OSM request failed.'; }
     finally { loading = false; }
   }
 
+  async function getOvertureRoads() {
+    if (!map) return;
+    if (map.getZoom() < 12) { error = 'Zoom in to level 12 or closer before getting Overture data (keeps the GeoParquet query small).'; return; }
+    loading = true; error = ''; junctions = null; status = 'Resolving Overture GeoParquet assets and starting DuckDB-WASM…';
+    try {
+      const bounds = map.getBounds();
+      const result = await loadOvertureRoads(
+        { west: bounds.getWest(), south: bounds.getSouth(), east: bounds.getEast(), north: bounds.getNorth() },
+        (message) => { status = message; }
+      );
+      roads = [];
+      overtureArrowIpc = result.arrowIpc;
+      detectorCrs = 'bng';
+      hasRoadData = result.count > 0;
+      setSource('roads', result.roadGeoJson);
+      status = `Loaded ${result.count.toLocaleString()} Overture road segments from ${result.release} via GeoParquet and DuckDB-WASM. Click Generate junctions.`;
+    } catch (reason) { error = reason instanceof Error ? reason.message : String(reason); status = 'Overture GeoParquet query failed.'; }
+    finally { loading = false; }
+  }
+
+  function displayPoint(point: number[]): [number, number] {
+    return detectorCrs === 'bng' ? proj4('EPSG:27700', 'EPSG:4326', point) as [number, number] : unproject(point);
+  }
+
   async function generate() {
-    if (!osm) { error = 'Download OSM data first.'; return; }
+    if (!hasRoadData) { error = 'Get OSM or Overture road data first.'; return; }
     loading = true; error = ''; status = 'Running junction detection in WebAssembly…';
     try {
       const config = { buffer_m: bufferM, min_arms: minArms, cluster_distance_m: clusterDistanceM, detect_intersections: detectIntersections };
-      const projected = JSON.parse(generate_junctions(JSON.stringify(getRoads()), JSON.stringify(config))) as GeoJSON.FeatureCollection;
+      const projected = JSON.parse(overtureArrowIpc
+        ? generate_junctions_arrow(overtureArrowIpc, JSON.stringify(config))
+        : generate_junctions(JSON.stringify(roads), JSON.stringify(config))) as GeoJSON.FeatureCollection;
       projected.features.forEach((feature) => {
-        if (feature.geometry?.type === 'Polygon') feature.geometry.coordinates = feature.geometry.coordinates.map((ring) => ring.map((point) => unproject(point)));
+        if (feature.geometry?.type === 'MultiPolygon') feature.geometry.coordinates = feature.geometry.coordinates.map((polygon) => polygon.map((ring) => ring.map((point) => displayPoint(point))));
       });
       junctions = projected; setSource('junctions', projected);
       status = `Generated ${projected.features.length.toLocaleString()} junctions in the browser.`;
@@ -142,10 +179,11 @@
           <ChevronDown size={20} strokeWidth={2.5} aria-hidden="true" />
         </button>
       </div>
-      <p class="intro">Browse an area, download its OpenStreetMap road data, then detect junctions locally in your browser.</p>
+      <p class="intro">Browse an area, get OpenStreetMap road data into browser memory, then detect junctions locally. Overture Maps GeoParquet is available for larger areas.</p>
       <div class="actions">
-        <button class="primary" onclick={downloadOsm} disabled={loading}>{loading ? 'Working…' : 'Download OSM for current view'}</button>
-        <button onclick={generate} disabled={loading || !osm}>Generate junctions</button>
+        <button class="primary" onclick={downloadOsm} disabled={loading}>{loading ? 'Working…' : 'Get OSM data'}</button>
+        <button onclick={getOvertureRoads} disabled={loading}>Get Overture roads</button>
+        <button onclick={generate} disabled={loading || !hasRoadData}>Generate junctions</button>
         <button class="secondary" onclick={downloadJunctions} disabled={!junctions}>Download junction GeoJSON</button>
       </div>
       <section>
@@ -159,7 +197,7 @@
       </section>
       <p class="status">{status}</p>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
-      <p class="attribution">Basemap © OpenFreeMap contributors · Data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors · Overpass API</p>
+      <p class="attribution">Basemap © OpenFreeMap contributors · OSM data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors via Overpass · Overture Maps data via GeoParquet</p>
   </aside>
   <button class:show-panel-hidden={panelOpen} class="show-panel" type="button" onclick={showPanel} aria-expanded={panelOpen} aria-controls="control-panel" aria-label="Show controls" title="Show controls">
       <SlidersHorizontal size={21} strokeWidth={2.5} aria-hidden="true" />

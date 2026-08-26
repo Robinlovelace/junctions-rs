@@ -3,8 +3,8 @@ use junctions_core::{Config, Road, find_junctions};
 
 /// Detect junctions from a JSON array of projected road centrelines.
 ///
-/// @param roads_json A JSON array of `{id, coordinates, level}` roads.
-/// @param buffer_m Polygon half-width in projected metres.
+/// @param roads_json A JSON array of `{id, coordinates, node_ids, level}` roads.
+/// @param buffer_m Radius of round point buffers in projected metres.
 /// @param min_arms Minimum contributing-road count.
 /// @param cluster_distance_m Candidate-node merge tolerance in metres.
 /// @return A JSON array of deterministic junctions.

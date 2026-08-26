@@ -11,6 +11,11 @@ repository.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+arrow-array = "54"
+arrow-ipc = "54"
+arrow-schema = "54"
+geo-types = "0.7"
+geozero = { version = "0.15", default-features = false, features = ["with-wkb", "with-geo"] }
 junctions-core = { path = "../../crates/junctions-core" }
 serde_json.workspace = true
 wasm-bindgen = "0.2"

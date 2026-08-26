@@ -12,6 +12,22 @@
 3. Geographic CRS transforms, OSM tag normalisation, and download policy live *outside* the core. Inputs must use a local projected CRS in metres. This keeps the core reproducible, testable, and usable with non-OSM road sources.
 4. Future adapters should consume the same serialisable contract. GeoArrow/Arrow is the preferred high-throughput interchange once vectorised arrays are introduced; UniFFI/WASM are candidates for other languages and browsers.
 
+## Geometry and identifiers
+
+The core creates a round planar buffer for each accepted candidate node, performs
+a batched unary union, then takes a convex hull for each dissolved component.
+This matches the `ST_Buffer` → `ST_Union_Agg` → `ST_Dump` → `ST_ConvexHull`
+footprint sequence used by DuckDB `junctions_cluster`, while remaining pure Rust
+and WASM-compatible. Output is always represented as GeoJSON-compatible
+MultiPolygon coordinates so disconnected components are never falsely bridged.
+
+When aligned `Road.node_ids` are available, a junction ID is a length-prefixed,
+collision-free canonical combination of its level plus sorted, deduplicated
+merged node IDs and contributing way IDs. The canonical `node_ids` and
+`way_ids` are also output for direct auditability. Interior-only crossings
+without a source node add sorted exact candidate-coordinate bit patterns to the
+identity as a deterministic fallback.
+
 This is inspired by the GeoRust/GeoArrow ecosystem: native algorithms separated from Python/WASM adapters and Arrow-shaped interoperability. PyO3/maturin is the standard Python wheel route; extendr provides the R-native route.
 
 ## Why not use a C ABI as the primary public API?

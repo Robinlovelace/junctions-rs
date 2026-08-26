@@ -4,9 +4,10 @@
 //! separation and deterministic clustering. CRS transformation, OSM ingestion,
 //! and language-specific shapes are deliberately adapters, not core concerns.
 
+use geo::algorithm::bool_ops::unary_union;
 use geo::line_intersection::{LineIntersection, line_intersection};
-use geo::{ConvexHull, Line, MultiPoint};
-use geo_types::{Coord, Point, Polygon};
+use geo::{Buffer, ConvexHull, Line};
+use geo_types::{Coord, MultiPolygon, Point, Polygon};
 use rstar::{AABB, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,6 +19,10 @@ pub struct Road {
     pub id: String,
     /// Projected planar coordinates in metres, with at least two positions.
     pub coordinates: Vec<[f64; 2]>,
+    /// Optional source-node IDs aligned with `coordinates`. OSM ways provide
+    /// these directly; generic line sources may omit them.
+    #[serde(default)]
+    pub node_ids: Vec<String>,
     /// Vertical connectivity class: bridges/tunnels must use a separate level.
     #[serde(default)]
     pub level: i32,
@@ -27,7 +32,7 @@ pub struct Road {
 pub struct Config {
     /// Merge candidate nodes nearer than this distance in projected metres.
     pub cluster_distance_m: f64,
-    /// Half-width of the square used to make a deterministic junction polygon.
+    /// Radius of round point buffers used to make junction polygons.
     pub buffer_m: f64,
     /// Ignore clusters with fewer contributing road arms.
     pub min_arms: usize,
@@ -60,8 +65,12 @@ pub struct Junction {
     pub y: f64,
     pub num_nodes: usize,
     pub num_arms: usize,
-    /// Closed convex-hull ring, serialisable by all adapters.
-    pub polygon: Vec<[f64; 2]>,
+    /// Canonical IDs of source nodes merged into this junction, when supplied.
+    pub node_ids: Vec<String>,
+    /// Canonical IDs of source ways contributing an arm to this junction.
+    pub way_ids: Vec<String>,
+    /// GeoJSON MultiPolygon coordinates: polygons → rings → positions.
+    pub polygons: Vec<Vec<Vec<[f64; 2]>>>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -79,6 +88,7 @@ struct Candidate {
     point: Coord<f64>,
     level: i32,
     roads: Vec<usize>,
+    node_ids: Vec<String>,
 }
 
 /// Find same-level endpoint and interior-crossing junctions in projected roads.
@@ -102,15 +112,26 @@ pub fn find_junctions(roads: &[Road], config: Config) -> Result<Vec<Junction>, J
             continue;
         }
         let center = centroid(&cluster.points);
-        let polygon = hull_for_points(&cluster.points, config.buffer_m);
+        cluster.node_ids.sort();
+        cluster.node_ids.dedup();
+        let mut way_ids = cluster
+            .roads
+            .iter()
+            .map(|index| roads[*index].id.clone())
+            .collect::<Vec<_>>();
+        way_ids.sort();
+        way_ids.dedup();
+        let polygons = dissolved_buffers(&cluster.points, config.buffer_m);
         result.push(Junction {
-            id: String::new(),
+            id: stable_junction_id(cluster.level, &cluster.node_ids, &way_ids, &cluster.points),
             level: cluster.level,
             x: center.x,
             y: center.y,
             num_nodes: cluster.points.len(),
             num_arms: arm_count,
-            polygon,
+            node_ids: cluster.node_ids.clone(),
+            way_ids,
+            polygons,
         });
     }
     result.sort_by(|a, b| {
@@ -119,9 +140,6 @@ pub fn find_junctions(roads: &[Road], config: Config) -> Result<Vec<Junction>, J
             .then_with(|| a.y.total_cmp(&b.y))
             .then_with(|| a.x.total_cmp(&b.x))
     });
-    for (index, junction) in result.iter_mut().enumerate() {
-        junction.id = format!("j{index}");
-    }
     Ok(result)
 }
 
@@ -151,14 +169,18 @@ fn validate(roads: &[Road], config: Config) -> Result<(), JunctionError> {
 fn endpoint_candidates(roads: &[Road]) -> Vec<Candidate> {
     let mut out = Vec::with_capacity(roads.len() * 2);
     for (road_index, road) in roads.iter().enumerate() {
-        for coordinate in [
-            road.coordinates[0],
-            *road.coordinates.last().expect("validated"),
-        ] {
+        for coordinate_index in [0, road.coordinates.len() - 1] {
             out.push(Candidate {
-                point: Coord::from(coordinate),
+                point: Coord::from(road.coordinates[coordinate_index]),
                 level: road.level,
                 roads: vec![road_index],
+                node_ids: road
+                    .node_ids
+                    .get(coordinate_index)
+                    .filter(|id| !id.is_empty())
+                    .cloned()
+                    .into_iter()
+                    .collect(),
             });
         }
     }
@@ -228,6 +250,7 @@ fn intersection_candidates(roads: &[Road]) -> Vec<Candidate> {
                             point: intersection,
                             level: left.level,
                             roads: vec![left_index, right_index],
+                            node_ids: Vec::new(),
                         });
                     }
                 }
@@ -242,6 +265,7 @@ struct Cluster {
     level: i32,
     points: Vec<Coord<f64>>,
     roads: Vec<usize>,
+    node_ids: Vec<String>,
 }
 
 /// R-tree key over every accepted candidate position, so a new candidate can
@@ -290,6 +314,7 @@ fn cluster_candidates(mut candidates: Vec<Candidate>, distance: f64) -> Vec<Clus
         if let Some(cluster_index) = target {
             clusters[cluster_index].points.push(candidate.point);
             clusters[cluster_index].roads.extend(candidate.roads);
+            clusters[cluster_index].node_ids.extend(candidate.node_ids);
             entries.insert(ClusterEntry {
                 cluster_index,
                 level: candidate.level,
@@ -302,6 +327,7 @@ fn cluster_candidates(mut candidates: Vec<Candidate>, distance: f64) -> Vec<Clus
             level: candidate.level,
             points: vec![candidate.point],
             roads: candidate.roads,
+            node_ids: candidate.node_ids,
         });
         entries.insert(ClusterEntry {
             cluster_index,
@@ -324,25 +350,57 @@ fn centroid(points: &[Coord<f64>]) -> Coord<f64> {
     }
 }
 
-fn hull_for_points(points: &[Coord<f64>], buffer: f64) -> Vec<[f64; 2]> {
-    let corners = points
+fn dissolved_buffers(points: &[Coord<f64>], buffer: f64) -> Vec<Vec<Vec<[f64; 2]>>> {
+    let buffers: Vec<MultiPolygon<f64>> = points
         .iter()
-        .flat_map(|point| {
-            [
-                Point::new(point.x - buffer, point.y - buffer),
-                Point::new(point.x - buffer, point.y + buffer),
-                Point::new(point.x + buffer, point.y - buffer),
-                Point::new(point.x + buffer, point.y + buffer),
-            ]
-        })
-        .collect::<Vec<_>>();
-    let polygon: Polygon<f64> = MultiPoint::from(corners).convex_hull();
-    polygon
-        .exterior()
+        .map(|point| Point::new(point.x, point.y).buffer(buffer))
+        .collect();
+    let dissolved = unary_union(buffers.iter());
+    dissolved
         .0
         .iter()
-        .map(|coord| [coord.x, coord.y])
+        .map(|polygon| polygon_coordinates(&polygon.convex_hull()))
         .collect()
+}
+
+fn polygon_coordinates(polygon: &Polygon<f64>) -> Vec<Vec<[f64; 2]>> {
+    std::iter::once(polygon.exterior())
+        .chain(polygon.interiors())
+        .map(|ring| ring.0.iter().map(|coord| [coord.x, coord.y]).collect())
+        .collect()
+}
+
+fn stable_junction_id(
+    level: i32,
+    node_ids: &[String],
+    way_ids: &[String],
+    points: &[Coord<f64>],
+) -> String {
+    let mut identity = format!(
+        "junction:level={level}:nodes={}:ways={}",
+        canonical_id_list(node_ids),
+        canonical_id_list(way_ids)
+    );
+    if node_ids.is_empty() {
+        identity.push_str(&format!(";points={}", canonical_point_list(points)));
+    }
+    identity
+}
+
+fn canonical_id_list(ids: &[String]) -> String {
+    ids.iter()
+        .map(|id| format!("{}:{id}", id.len()))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn canonical_point_list(points: &[Coord<f64>]) -> String {
+    let mut encoded = points
+        .iter()
+        .map(|point| format!("{:016x}:{:016x}", point.x.to_bits(), point.y.to_bits()))
+        .collect::<Vec<_>>();
+    encoded.sort();
+    encoded.join("|")
 }
 
 #[cfg(test)]
@@ -352,8 +410,53 @@ mod tests {
         Road {
             id: id.into(),
             coordinates,
+            node_ids: Vec::new(),
             level,
         }
+    }
+
+    #[test]
+    fn dissolves_touching_round_point_buffers() {
+        let polygons =
+            dissolved_buffers(&[Coord { x: 0.0, y: 0.0 }, Coord { x: 8.0, y: 0.0 }], 5.0);
+        assert_eq!(polygons.len(), 1, "overlapping circles must dissolve");
+        let ring = &polygons[0][0];
+        assert!(
+            ring.len() > 8,
+            "a round buffer needs more than square corners"
+        );
+        assert!(ring.iter().any(|point| point[0] < -4.9));
+        assert!(ring.iter().any(|point| point[0] > 12.9));
+    }
+
+    #[test]
+    fn retains_disconnected_buffers_as_multipolygon_parts() {
+        let polygons =
+            dissolved_buffers(&[Coord { x: 0.0, y: 0.0 }, Coord { x: 11.0, y: 0.0 }], 5.0);
+        assert_eq!(polygons.len(), 2, "separate circles must not be bridged");
+    }
+
+    #[test]
+    fn uses_canonical_source_nodes_and_ways_for_stable_ids() {
+        let mut roads = vec![
+            road("way-z", vec![[-10., 0.], [0., 0.]], 0),
+            road("way-a", vec![[0., 0.], [10., 0.]], 0),
+            road("way-m", vec![[0., 0.], [0., 10.]], 0),
+        ];
+        roads[0].node_ids = vec!["node-west".into(), "node-centre".into()];
+        roads[1].node_ids = vec!["node-centre".into(), "node-east".into()];
+        roads[2].node_ids = vec!["node-centre".into(), "node-north".into()];
+
+        let found = find_junctions(&roads, Config::default()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].node_ids, vec!["node-centre"]);
+        assert_eq!(found[0].way_ids, vec!["way-a", "way-m", "way-z"]);
+        assert!(found[0].id.contains("node-centre"));
+        assert!(found[0].id.contains("way-a"));
+
+        roads.reverse();
+        let reordered = find_junctions(&roads, Config::default()).unwrap();
+        assert_eq!(found[0].id, reordered[0].id);
     }
 
     #[test]
@@ -373,6 +476,22 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].num_arms, 2);
         assert_eq!(found[0].num_nodes, 1);
+    }
+
+    #[test]
+    fn distinguishes_node_less_junctions_by_exact_candidate_points() {
+        let ways = vec!["h".into(), "v".into()];
+        let first = stable_junction_id(0, &[], &ways, &[Coord { x: 0.0, y: 0.0 }]);
+        let second = stable_junction_id(
+            0,
+            &[],
+            &ways,
+            &[Coord {
+                x: 0.000_001,
+                y: 0.0,
+            }],
+        );
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -398,6 +517,7 @@ mod tests {
         let found = find_junctions(&roads, Config::default()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].num_arms, 3);
-        assert!(found[0].polygon.len() >= 4);
+        assert_eq!(found[0].polygons.len(), 1);
+        assert!(found[0].polygons[0][0].len() > 8);
     }
 }

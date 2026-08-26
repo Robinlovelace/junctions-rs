@@ -8,6 +8,7 @@ fn star(size: usize) -> Vec<Road> {
             Road {
                 id: format!("r{index}"),
                 coordinates: vec![[angle.cos() * 100.0, angle.sin() * 100.0], [0.0, 0.0]],
+                node_ids: vec![format!("outer-{index}"), "centre".into()],
                 level: 0,
             }
         })

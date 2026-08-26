@@ -8,16 +8,18 @@ junctions(roads, buffer_m = 5, min_arms = 3, cluster_distance_m = 0.01)
 }
 \arguments{
 \item{roads}{A list of roads. Each item must have \code{id}, \code{coordinates} (a
-matrix/list of projected two-number coordinate positions) and optional \code{level}.}
+matrix/list of projected two-number coordinate positions), optional aligned
+\code{node_ids}, and optional \code{level}.}
 
-\item{buffer_m}{Polygon half-width in projected metres.}
+\item{buffer_m}{Radius of round point buffers in projected metres.}
 
 \item{min_arms}{Minimum number of contributing roads.}
 
 \item{cluster_distance_m}{Candidate-node merge tolerance in metres.}
 }
 \value{
-A data frame with a list-column \code{polygon} of closed coordinate rings.
+A data frame with a \code{polygons} MultiPolygon coordinate list-column
+and canonical \code{node_ids}/\code{way_ids} contributing to each junction.
 }
 \description{
 Detect road junctions with the Rust core
