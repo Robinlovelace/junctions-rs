@@ -6,7 +6,7 @@
 
 use geo::algorithm::bool_ops::unary_union;
 use geo::line_intersection::{LineIntersection, line_intersection};
-use geo::{Buffer, Intersects, Line};
+use geo::{Buffer, ConvexHull, Intersects, Line};
 use geo_types::{Coord, MultiPolygon, Point, Polygon};
 use rstar::{AABB, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
@@ -104,8 +104,8 @@ struct Candidate {
 /// least `min_arms` incident road ends is buffered at its road's radius, all
 /// buffers on one level are dissolved, and each connected component becomes
 /// one junction polygon (its convex hull). This matches the GEOS
-/// `ST_Union_Agg(ST_Buffer(...))` semantics of `junctions_cluster`, so nearby
-/// junctions whose buffers overlap merge into a single junction system.
+/// `ST_Union_Agg(ST_Buffer(...))` and `ST_ConvexHull` semantics of `junctions_cluster`,
+/// so nearby junctions whose buffers overlap merge into a single junction system.
 ///
 /// This is intentionally deterministic: output IDs are sorted by level, y then
 /// x. Input road geometry must be in a local projected CRS in metres.
@@ -195,12 +195,14 @@ pub fn find_junctions(roads: &[Road], config: Config) -> Result<Vec<Junction>, J
                 .collect::<Vec<_>>();
             way_ids.sort();
             way_ids.dedup();
-            // The junction polygon is the dissolved buffer component itself:
-            // circular buffers union only where they touch, so disjoint
-            // junction systems can never overlap. (The counterflow/DuckDB
-            // references take a convex hull here instead, which inflates each
-            // component and lets nearby hulls overlap.)
-            let polygons = vec![polygon_coordinates(component)];
+            // The junction polygon is the convex hull of each dissolved buffer
+            // component. Candidate circular buffers merge only where they touch or
+            // overlap, forming connected components per level. Each component emits
+            // its convex hull polygon. While the convex hulls of nearby disjoint
+            // components can geometrically overlap in space, they remain separate
+            // topological junctions with distinct IDs and node memberships.
+            let hull = component.convex_hull();
+            let polygons = vec![polygon_coordinates(&hull)];
             result.push(Junction {
                 id: stable_junction_id(level, &node_ids, &way_ids, &points),
                 level,
@@ -504,6 +506,7 @@ fn canonical_point_list(points: &[Coord<f64>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn road(id: &str, coordinates: Vec<[f64; 2]>, level: i32) -> Road {
         Road {
             id: id.into(),
@@ -512,6 +515,37 @@ mod tests {
             level,
             buffer_m: None,
         }
+    }
+
+    fn is_convex_polygon(ring: &[[f64; 2]]) -> bool {
+        let pts: Vec<[f64; 2]> = if ring.first() == ring.last() && ring.len() > 1 {
+            ring[..ring.len() - 1].to_vec()
+        } else {
+            ring.to_vec()
+        };
+        if pts.len() < 3 {
+            return true;
+        }
+        let n = pts.len();
+        let mut sign = 0;
+        for i in 0..n {
+            let p1 = pts[i];
+            let p2 = pts[(i + 1) % n];
+            let p3 = pts[(i + 2) % n];
+            let v1x = p2[0] - p1[0];
+            let v1y = p2[1] - p1[1];
+            let v2x = p3[0] - p2[0];
+            let v2y = p3[1] - p2[1];
+            let cross = v1x * v2y - v1y * v2x;
+            if cross.abs() > 1e-7 {
+                if sign == 0 {
+                    sign = if cross > 0.0 { 1 } else { -1 };
+                } else if (cross > 0.0 && sign < 0) || (cross < 0.0 && sign > 0) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     #[test]
@@ -547,6 +581,28 @@ mod tests {
         );
         assert!(ring.iter().any(|point| point[0] < -4.9));
         assert!(ring.iter().any(|point| point[0] > 12.9));
+
+        // The output polygon must be a true convex hull:
+        assert!(
+            is_convex_polygon(ring),
+            "junction polygon must be a convex hull"
+        );
+
+        // Check that the convex hull bridges the waist between the two nodes:
+        // A Polygon reconstructed from the hull ring contains the midpoint waist (4.0, 4.5).
+        // (In a raw dissolved peanut buffer, at x=4.0 the boundary is y <= 3.0, so (4.0, 4.5) is outside).
+        let poly = Polygon::new(
+            geo_types::LineString::from(ring.iter().map(|p| Coord::from(*p)).collect::<Vec<_>>()),
+            vec![],
+        );
+        assert!(
+            poly.intersects(&Point::new(4.0, 4.5)),
+            "convex hull must enclose the bridged waist (4.0, 4.5)"
+        );
+        assert!(
+            poly.intersects(&Point::new(4.0, -4.5)),
+            "convex hull must enclose the bridged waist (4.0, -4.5)"
+        );
     }
 
     #[test]
@@ -569,6 +625,113 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.len(), 2, "separate circles must not be bridged");
+        assert_eq!(found[0].num_nodes, 1);
+        assert_eq!(found[1].num_nodes, 1);
+        assert!(is_convex_polygon(&found[0].polygons[0][0]));
+        assert!(is_convex_polygon(&found[1].polygons[0][0]));
+    }
+
+    #[test]
+    fn disjoint_components_with_overlapping_convex_hulls_remain_separate() {
+        // Component 1: two nodes at (0, 0) and (0, 8) with 5.0 m buffers (overlap since 8 < 10).
+        // Its convex hull spans x in [-5, 5], y in [-5, 13].
+        // Component 2: node at (4.0, 4.0) with buffer 0.5 m.
+        // Distance to (0, 0) is sqrt(16+16) = sqrt(32) ≈ 5.66 > 5.0 + 0.5 = 5.5.
+        // Distance to (0, 8) is sqrt(16+16) = sqrt(32) ≈ 5.66 > 5.0 + 0.5 = 5.5.
+        // At y=4.0, Component 1's raw circular buffers only reach x=3.0, while Component 2 is at x in [3.5, 4.5].
+        // Candidate buffers do NOT touch, so Component 1 and 2 are disjoint during buffer dissolve.
+        // However, Component 2's convex hull is inside Component 1's convex hull.
+        let mut r_isolated_1 = road("iso-1", vec![[4.0, 4.0], [4.0, 5.0]], 0);
+        r_isolated_1.buffer_m = Some(0.5);
+        let mut r_isolated_2 = road("iso-2", vec![[4.0, 4.0], [5.0, 4.0]], 0);
+        r_isolated_2.buffer_m = Some(0.5);
+
+        let roads = vec![
+            road("a", vec![[-10., 0.], [0., 0.]], 0),
+            road("b", vec![[0., 0.], [0., 8.]], 0),
+            road("d", vec![[0., 8.], [10., 8.]], 0),
+            r_isolated_1,
+            r_isolated_2,
+        ];
+        let found = find_junctions(
+            &roads,
+            Config {
+                min_arms: 2,
+                buffer_m: 5.0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        // Candidate circular buffers are disjoint, so exactly 2 junctions are formed:
+        assert_eq!(
+            found.len(),
+            2,
+            "disjoint circular buffers must remain separate junctions"
+        );
+        let multi_node = found.iter().find(|j| j.num_nodes == 2).unwrap();
+        let single_node = found.iter().find(|j| j.num_nodes == 1).unwrap();
+        assert_eq!(multi_node.num_arms, 3);
+        assert_eq!(single_node.num_arms, 2);
+        assert!(is_convex_polygon(&multi_node.polygons[0][0]));
+        assert!(is_convex_polygon(&single_node.polygons[0][0]));
+
+        // Verify that their convex hulls geometrically overlap in planar space:
+        let poly1 = Polygon::new(
+            geo_types::LineString::from(
+                multi_node.polygons[0][0]
+                    .iter()
+                    .map(|p| Coord::from(*p))
+                    .collect::<Vec<_>>(),
+            ),
+            vec![],
+        );
+        let poly2 = Polygon::new(
+            geo_types::LineString::from(
+                single_node.polygons[0][0]
+                    .iter()
+                    .map(|p| Coord::from(*p))
+                    .collect::<Vec<_>>(),
+            ),
+            vec![],
+        );
+        assert!(
+            poly1.intersects(&poly2),
+            "convex hulls of separate disjoint components can geometrically overlap"
+        );
+    }
+
+    #[test]
+    fn convex_hull_bridges_l_shaped_cluster() {
+        // Three nodes forming an L-shape at (0, 0), (0, 10), (10, 0) with buffer 6.0 m.
+        // (0,0)-(0,10) distance 10 <= 12 (touch/overlap).
+        // (0,0)-(10,0) distance 10 <= 12 (touch/overlap).
+        // (0,10)-(10,0) distance sqrt(200) ≈ 14.14 > 12 (buffers do not touch across diagonal).
+        // All 3 merge into 1 connected dissolved component.
+        // The convex hull spans the diagonal across (0,10) and (10,0), enclosing (5, 5).
+        let roads = vec![
+            road("v1", vec![[0., -5.], [0., 0.]], 0),
+            road("v2", vec![[0., 0.], [0., 10.]], 0),
+            road("v3", vec![[0., 10.], [0., 15.]], 0),
+            road("h1", vec![[-5., 0.], [0., 0.]], 0),
+            road("h2", vec![[0., 0.], [10., 0.]], 0),
+            road("h3", vec![[10., 0.], [15., 0.]], 0),
+        ];
+        let found = find_junctions(
+            &roads,
+            Config {
+                min_arms: 2,
+                buffer_m: 6.0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].num_nodes, 3);
+        let ring = &found[0].polygons[0][0];
+        assert!(
+            is_convex_polygon(ring),
+            "merged L-shape junction must output a convex hull"
+        );
     }
 
     #[test]
@@ -594,6 +757,7 @@ mod tests {
             extent < 5.6,
             "junction must buffer at the minimum radius, got {extent:.2} m"
         );
+        assert!(is_convex_polygon(ring));
     }
 
     #[test]
@@ -636,6 +800,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].num_arms, 2);
         assert_eq!(found[0].num_nodes, 1);
+        assert!(is_convex_polygon(&found[0].polygons[0][0]));
     }
 
     #[test]
@@ -679,5 +844,6 @@ mod tests {
         assert_eq!(found[0].num_arms, 3);
         assert_eq!(found[0].polygons.len(), 1);
         assert!(found[0].polygons[0][0].len() > 8);
+        assert!(is_convex_polygon(&found[0].polygons[0][0]));
     }
 }

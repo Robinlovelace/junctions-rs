@@ -16,15 +16,21 @@
 
 The core creates a round planar buffer for every accepted candidate node
 (road endpoint or interior crossing) at its road's radius, dissolves all
-buffers on one level with a batched unary union, and treats each connected
-component of the dissolved union as one junction system. A junction polygon
-is the component itself: circular buffers union only where they touch, so
-disjoint junction systems can never overlap. The DuckDB `junctions_cluster`
-macro additionally takes an `ST_ConvexHull` per component — a smoothing step
-that inflates each system and lets nearby hulls overlap; the core deliberately
-outputs the unioned buffers instead. Output is always represented as
-GeoJSON-compatible MultiPolygon coordinates so disconnected components are
-never falsely bridged.
+buffers on one level with a batched unary union, and takes a convex hull for
+each connected component. A component is one junction system: nearby nodes
+whose circular buffers overlap merge into a single junction polygon. This
+matches the `ST_Buffer` → `ST_Union_Agg` → `ST_Dump` → `ST_ConvexHull` footprint
+sequence used by DuckDB `junctions_cluster`, while remaining pure Rust and
+WASM-compatible. Output is always represented as GeoJSON-compatible
+MultiPolygon coordinates so disconnected components are never falsely bridged.
+
+Geometric overlap contract: Candidate circular buffers merge into the same
+component strictly when they touch or overlap. Disjoint buffer components do
+not merge into the same junction, preserving deterministic node membership and
+arm counts. When each component's convex hull is emitted as the junction polygon,
+the hulls of nearby disjoint components can geometrically overlap in planar space
+(an inherent property of convex hulls of non-convex/multi-node clusters), but they
+remain separate topological junctions with unique IDs, centroids, and stats.
 
 Buffer radii: a road may carry its own `buffer_m` (e.g. road-class radii from
 OS Open Roads); a node buffers at the minimum radius of its incident roads,
