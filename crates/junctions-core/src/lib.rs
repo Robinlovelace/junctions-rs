@@ -6,7 +6,7 @@
 
 use geo::algorithm::bool_ops::unary_union;
 use geo::line_intersection::{LineIntersection, line_intersection};
-use geo::{Buffer, ConvexHull, Intersects, Line};
+use geo::{Buffer, Intersects, Line};
 use geo_types::{Coord, MultiPolygon, Point, Polygon};
 use rstar::{AABB, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
@@ -136,7 +136,35 @@ pub fn find_junctions(roads: &[Road], config: Config) -> Result<Vec<Junction>, J
             .map(|p| Point::new(p.point.x, p.point.y).buffer(p.buffer_m))
             .collect();
         let dissolved = unary_union(buffers.iter());
-        for component in &dissolved.0 {
+        // geo's i_overlay union can return overlapping parts when many
+        // circles nearly touch (observed with ~180 overlapping buffers).
+        // Merge any intersecting parts to a fixpoint so components are
+        // guaranteed disjoint — a junction system never overlaps another.
+        let mut parts = dissolved.0;
+        let mut passes = 0;
+        loop {
+            passes += 1;
+            if passes > parts.len() + 1 {
+                break;
+            }
+            let mut merged_any = false;
+            'outer: for i in 0..parts.len() {
+                for j in (i + 1)..parts.len() {
+                    if parts[i].intersects(&parts[j]) {
+                        let pair = unary_union([&parts[i], &parts[j]]);
+                        parts[i] = pair.0[0].clone();
+                        parts.extend(pair.0.into_iter().skip(1));
+                        parts.swap_remove(j);
+                        merged_any = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if !merged_any {
+                break;
+            }
+        }
+        for component in &parts {
             let members: Vec<&Position> = qualifying
                 .iter()
                 .copied()
@@ -167,7 +195,12 @@ pub fn find_junctions(roads: &[Road], config: Config) -> Result<Vec<Junction>, J
                 .collect::<Vec<_>>();
             way_ids.sort();
             way_ids.dedup();
-            let polygons = vec![polygon_coordinates(&component.convex_hull())];
+            // The junction polygon is the dissolved buffer component itself:
+            // circular buffers union only where they touch, so disjoint
+            // junction systems can never overlap. (The counterflow/DuckDB
+            // references take a convex hull here instead, which inflates each
+            // component and lets nearby hulls overlap.)
+            let polygons = vec![polygon_coordinates(component)];
             result.push(Junction {
                 id: stable_junction_id(level, &node_ids, &way_ids, &points),
                 level,
