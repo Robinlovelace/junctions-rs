@@ -1,0 +1,8 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type": "Feature", "properties": {"id": "west", "level": 0}, "geometry": {"type": "LineString", "coordinates": [[-10, 0], [0, 0]]}},
+    {"type": "Feature", "properties": {"id": "east", "level": 0}, "geometry": {"type": "LineString", "coordinates": [[0, 0], [10, 0]]}},
+    {"type": "Feature", "properties": {"id": "north", "level": 0}, "geometry": {"type": "LineString", "coordinates": [[0, 0], [0, 10]]}}
+  ]
+}

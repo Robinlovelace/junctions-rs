@@ -1,0 +1,3 @@
+useDynLib(junctionsrs, .registration = TRUE)
+importFrom(jsonlite, toJSON, fromJSON)
+export(junctions)

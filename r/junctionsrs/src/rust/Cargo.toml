@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "junctionsrs"
+publish = false
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+name = "junctionsrs"
+
+[[bin]]
+name = "document"
+path = "document.rs"
+
+[dependencies]
+extendr-api = "0.8"
+junctions-core = { path = "../../../../crates/junctions-core" }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

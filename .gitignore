@@ -1,0 +1,17 @@
+/target/
+**/target/
+*.so
+*.o
+*.a
+__pycache__/
+.pytest_cache/
+*.duckdb
+benchmarks/*.parquet
+benchmarks/*.pbf
+r/junctionsrs/src/Makevars
+r/junctionsrs/src/Makevars.win
+r/junctionsrs/src/.cargo/
+r/junctionsrs/src/rust/target/
+r/junctionsrs/src/rust/vendor/
+r/junctionsrs.Rcheck/
+junctionsrs.Rcheck/

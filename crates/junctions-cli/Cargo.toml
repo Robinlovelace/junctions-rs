@@ -1,0 +1,20 @@
+[package]
+name = "junctions"
+description = "CLI for portable road-junction detection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "junctions"
+path = "src/main.rs"
+
+[dependencies]
+junctions-core = { path = "../junctions-core" }
+anyhow.workspace = true
+clap.workspace = true
+geojson.workspace = true
+serde.workspace = true
+serde_json.workspace = true

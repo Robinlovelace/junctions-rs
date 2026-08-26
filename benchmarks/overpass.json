@@ -1,0 +1,26 @@
+[
+  {
+    "method": "overpass_api",
+    "radius_km": 1,
+    "seconds": 5.595004891045392,
+    "roads": 3567,
+    "bytes": 2263376,
+    "note": "fresh API query; bbox approximation of circle"
+  },
+  {
+    "method": "overpass_api",
+    "radius_km": 10,
+    "seconds": 5.631269441044424,
+    "roads": 72692,
+    "bytes": 49381463,
+    "note": "fresh API query; bbox approximation of circle"
+  },
+  {
+    "method": "overpass_api",
+    "radius_km": 100,
+    "seconds": 99.23088541498873,
+    "roads": 1837279,
+    "bytes": 1340530020,
+    "note": "fresh API query; bbox approximation of circle"
+  }
+]

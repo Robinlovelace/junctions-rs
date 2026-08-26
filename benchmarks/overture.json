@@ -1,0 +1,26 @@
+[
+  {
+    "method": "overture_geoparquet_materialized",
+    "radius_km": 1,
+    "seconds": 18.131068910006434,
+    "roads": 3403,
+    "bytes": 254435,
+    "note": "remote GeoParquet predicate query with geometry materialised locally"
+  },
+  {
+    "method": "overture_geoparquet_materialized",
+    "radius_km": 10,
+    "seconds": 20.51148510799976,
+    "roads": 81923,
+    "bytes": 6583599,
+    "note": "remote GeoParquet predicate query with geometry materialised locally"
+  },
+  {
+    "method": "overture_geoparquet_materialized",
+    "radius_km": 100,
+    "seconds": 29.48236257402459,
+    "roads": 1966098,
+    "bytes": 186239325,
+    "note": "remote GeoParquet predicate query with geometry materialised locally"
+  }
+]

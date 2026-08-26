@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "junctions-rs"
+version = "0.1.0"
+description = "Fast road-junction detection backed by Rust"
+requires-python = ">=3.9"
+readme = "README.md"
+license = { text = "MIT" }
+classifiers = ["Programming Language :: Python :: 3", "Programming Language :: Rust"]
+
+[tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
+module-name = "junctions_rs"
+features = ["pyo3/extension-module"]

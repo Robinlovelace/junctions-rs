@@ -1,0 +1,17 @@
+[package]
+name = "junctions-core"
+description = "Fast, portable road junction clustering for projected road centrelines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+geo.workspace = true
+geo-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
