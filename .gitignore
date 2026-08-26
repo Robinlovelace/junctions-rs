@@ -14,4 +14,7 @@ r/junctionsrs/src/.cargo/
 r/junctionsrs/src/rust/target/
 r/junctionsrs/src/rust/vendor/
 r/junctionsrs.Rcheck/
+web/node_modules/
+web/dist/
+web/src/lib/wasm/
 junctionsrs.Rcheck/

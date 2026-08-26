@@ -51,6 +51,24 @@ junctionsrs::junctions(list(
 ))
 ```
 
+## Browser explorer
+
+The `web/` app is a Svelte 5 + Vite + MapLibre explorer powered by the WASM
+adapter in `bindings/wasm`. It follows the osm2streets workflow: pan/zoom the
+map, download the current OSM road ways from Overpass, then generate junctions
+locally in WebAssembly. Parameters can be changed and both downloaded OSM JSON
+and junction GeoJSON are available from the UI.
+
+```sh
+cd web
+npm install
+npm run check
+npm run dev
+```
+
+The deployed explorer is <https://robinlovelace.github.io/junctions-rs/>.
+OSM-derived downloads retain OpenStreetMap attribution and are subject to ODbL.
+
 ## Design
 
 - **Core (`junctions-core`)**: stable Rust domain structs and algorithm; no Python, R, OSM API, DuckDB, or I/O dependencies.
