@@ -5,12 +5,16 @@ import duckdbWorker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?
 import duckdbWorkerEh from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url';
 import { tableToIPC } from 'apache-arrow';
 
-export type Bounds = { west: number; south: number; east: number; north: number };
+export type Bounds = { west: number; south: number; east: number; north: number; wraps?: boolean };
 export type OvertureRoads = {
   arrowIpc: Uint8Array;
   roadGeoJson: GeoJSON.FeatureCollection;
   count: number;
   release: string;
+  /** UTM zone CRS used for the metre-based detector, as a proj4 string. */
+  crsProj: string;
+  /** UTM EPSG code used for the DuckDB ST_Transform (e.g. 32630). */
+  epsg: number;
 };
 
 type StacLink = { rel?: string; href: string; title?: string };
@@ -36,7 +40,20 @@ function firstLink(catalog: StacCatalog, rel: string, title?: string): string {
 }
 
 function intersects(bounds: Bounds, bbox?: [number, number, number, number]): boolean {
-  return Boolean(bbox && !(bbox[2] < bounds.west || bbox[0] > bounds.east || bbox[3] < bounds.south || bbox[1] > bounds.north));
+  if (!bbox) return false;
+  const lonOverlap = bounds.wraps
+    ? bbox[2] >= bounds.west || bbox[0] <= bounds.east
+    : !(bbox[2] < bounds.west || bbox[0] > bounds.east);
+  return lonOverlap && !(bbox[3] < bounds.south || bbox[1] > bounds.north);
+}
+
+/** Viewport-centre longitude in [-180, 180), antimeridian-aware. */
+function boundsCenterLon(bounds: Bounds): number {
+  const span = bounds.wraps ? bounds.east - bounds.west + 360 : bounds.east - bounds.west;
+  let lon = bounds.west + span / 2;
+  if (lon > 180) lon -= 360;
+  if (lon < -180) lon += 360;
+  return lon;
 }
 
 async function stacJson<T>(url: string): Promise<T> {
@@ -82,8 +99,31 @@ function sqlString(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-function sourceSql(assets: string[], bounds: Bounds): string {
+/** UTM zone (1-60) for a longitude, WGS84. */
+function utmZone(lon: number): number {
+  return Math.floor((lon + 180) / 6) + 1;
+}
+
+/**
+ * Pick a metre-based projected CRS valid anywhere on Earth: WGS84 UTM, zone
+ * chosen from the viewport centre. 326xx = northern hemisphere, 327xx = south.
+ */
+export function utmCrs(center: { lon: number; lat: number }): { epsg: number; proj: string } {
+  const zone = utmZone(center.lon);
+  const south = center.lat < 0 ? '+south' : '';
+  return {
+    epsg: (center.lat >= 0 ? 32600 : 32700) + zone,
+    proj: `+proj=utm +zone=${zone}${south} +datum=WGS84 +units=m +no_defs`
+  };
+}
+
+function sourceSql(assets: string[], bounds: Bounds, epsg: number): string {
   const files = assets.map(sqlString).join(', ');
+  // A wrapped viewport (west > east, antimeridian) overlaps longitudes on both
+  // sides of ±180, so the bbox predicate becomes an OR of the two slivers.
+  const lonPredicate = bounds.wraps
+    ? `(bbox.xmin <= 180 AND bbox.xmax >= ${bounds.west}) OR (bbox.xmin <= ${bounds.east} AND bbox.xmax >= -180)`
+    : `bbox.xmin <= ${bounds.east} AND bbox.xmax >= ${bounds.west}`;
   return `
     CREATE TEMP TABLE overture_roads AS
     SELECT
@@ -92,19 +132,20 @@ function sourceSql(assets: string[], bounds: Bounds): string {
       COALESCE(level_rules[1].value, 0)::INTEGER AS level
     FROM read_parquet([${files}])
     WHERE subtype = 'road'
-      AND bbox.xmin <= ${bounds.east}
-      AND bbox.xmax >= ${bounds.west}
+      AND (${lonPredicate})
       AND bbox.ymin <= ${bounds.north}
       AND bbox.ymax >= ${bounds.south}`;
 }
 
-const PROJECTION_SQL = `
-  SELECT
-    id,
-    ST_AsWKB(ST_Transform(geometry, 'EPSG:4326', 'EPSG:27700')) AS geometry,
-    level,
-    ST_AsGeoJSON(geometry) AS geometry_json
-  FROM overture_roads`;
+function projectionSql(epsg: number): string {
+  return `
+    SELECT
+      id,
+      ST_AsWKB(ST_Transform(geometry, 'EPSG:4326', 'EPSG:${epsg}')) AS geometry,
+      level,
+      ST_AsGeoJSON(geometry) AS geometry_json
+    FROM overture_roads`;
+}
 
 export async function loadOvertureRoads(bounds: Bounds, onProgress: (message: string) => void): Promise<OvertureRoads> {
   if (cache && cacheContains(cache.bounds, bounds)) {
@@ -117,10 +158,12 @@ export async function loadOvertureRoads(bounds: Bounds, onProgress: (message: st
   const database = await connection(onProgress);
   const started = Date.now();
   onProgress('Reading Overture GeoParquet… the first query for an area takes about a minute (row groups span whole regions); repeat queries reuse the cached result.');
-  await database.query(sourceSql(assets, bounds));
+  const center = { lon: boundsCenterLon(bounds), lat: (bounds.south + bounds.north) / 2 };
+  const { epsg, proj } = utmCrs(center);
+  await database.query(sourceSql(assets, bounds, epsg));
   const ingestMs = Date.now() - started;
-  onProgress(`Filtered Overture segments in ${(ingestMs / 1000).toFixed(0)} s; projecting to BNG…`);
-  const table = await database.query(PROJECTION_SQL);
+  onProgress(`Filtered Overture segments in ${(ingestMs / 1000).toFixed(0)} s; projecting to UTM zone ${utmZone(center.lon)}…`);
+  const table = await database.query(projectionSql(epsg));
   const rows = table.toArray() as { id: string; level: number; geometry_json: string }[];
   const roadGeoJson: GeoJSON.FeatureCollection = {
     type: 'FeatureCollection',
@@ -131,11 +174,12 @@ export async function loadOvertureRoads(bounds: Bounds, onProgress: (message: st
     }))
   };
   const arrowIpc = tableToIPC(table.select(['id', 'geometry', 'level']), 'stream');
-  cache = { arrowIpc, roadGeoJson, count: rows.length, release, bounds };
+  cache = { arrowIpc, roadGeoJson, count: rows.length, release, crsProj: proj, epsg, bounds };
   return cache;
 }
 
 function cacheContains(cached: Bounds, requested: Bounds): boolean {
+  if (cached.wraps !== requested.wraps) return false;
   const overlapX = Math.min(cached.east, requested.east) - Math.max(cached.west, requested.west);
   const overlapY = Math.min(cached.north, requested.north) - Math.max(cached.south, requested.south);
   const width = requested.east - requested.west;

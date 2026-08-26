@@ -21,7 +21,9 @@
   // after this normalization step.
   let roads = $state.raw<Road[]>([]);
   let overtureArrowIpc = $state.raw<Uint8Array | null>(null);
-  let detectorCrs = $state<'local' | 'bng'>('local');
+  // Detector output CRS: 'local' = origin-anchored tangent plane (OSM path);
+  // a proj4 string = UTM zone for the Overture path (valid worldwide).
+  let detectorCrs = $state<'local' | string>('local');
   let hasRoadData = $state(false);
   let junctions = $state<GeoJSON.FeatureCollection | null>(null);
   let status = $state('Pan or zoom to an area, then get OSM data.');
@@ -35,10 +37,22 @@
 
   const mapStyle = 'https://tiles.openfreemap.org/styles/bright';
   const overpass = 'https://overpass-api.de/api/interpreter';
-  proj4.defs('EPSG:27700', '+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +datum=OSGB36 +units=m +no_defs');
+
+  function initialView(): { center: [number, number]; zoom: number } {
+    const params = new URLSearchParams(window.location.search);
+    const lat = Number(params.get('lat'));
+    const lng = Number(params.get('lng'));
+    const zoom = Number(params.get('z'));
+    if (Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+      return { center: [lng, lat], zoom: Number.isFinite(zoom) ? Math.min(Math.max(zoom, 2), 19) : 15 };
+    }
+    return { center: [origin.lon, origin.lat], zoom: 13 };
+  }
 
   onMount(() => {
-    map = new maplibregl.Map({ container: mapContainer, style: mapStyle, center: [origin.lon, origin.lat], zoom: 13 });
+    const view = initialView();
+    origin = { lon: view.center[0], lat: view.center[1] };
+    map = new maplibregl.Map({ container: mapContainer, style: mapStyle, center: view.center, zoom: view.zoom });
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }));
     map.on('load', () => addSources());
@@ -73,16 +87,38 @@
     return 0;
   }
 
+  /** Longitude difference in [-180, 180), safe across the antimeridian. */
+  function lonDiff(lon: number, refLon: number): number {
+    return ((lon - refLon + 540) % 360) - 180;
+  }
+
   function project(point: [number, number]): [number, number] {
     const r = 6371000;
     const rad = Math.PI / 180;
-    return [r * Math.cos(origin.lat * rad) * (point[0] - origin.lon) * rad, r * (point[1] - origin.lat) * rad];
+    return [r * Math.cos(origin.lat * rad) * lonDiff(point[0], origin.lon) * rad, r * (point[1] - origin.lat) * rad];
   }
 
   function unproject(point: number[]): [number, number] {
     const r = 6371000;
     const rad = Math.PI / 180;
-    return [origin.lon + point[0] / (r * Math.cos(origin.lat * rad)) / rad, origin.lat + point[1] / r / rad];
+    return [origin.lon + lonDiff(origin.lon + point[0] / (r * Math.cos(origin.lat * rad)) / rad, origin.lon), origin.lat + point[1] / r / rad];
+  }
+
+  /** Visible bounds; when the view crosses the antimeridian, west > east. */
+  function viewportBounds() {
+    const bounds = map!.getBounds();
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+    return { west, east, south, north, wraps: west > east };
+  }
+
+  async function fetchOsmBox(south: number, west: number, north: number, east: number): Promise<OsmResponse> {
+    const query = `[out:json][timeout:60];way[highway](${south},${west},${north},${east});out body geom;`;
+    const response = await fetch(`${overpass}?data=${encodeURIComponent(query)}`);
+    if (!response.ok) throw new Error(`Overpass returned HTTP ${response.status}`);
+    return response.json() as Promise<OsmResponse>;
   }
 
   function roadsGeoJson(): GeoJSON.FeatureCollection {
@@ -94,20 +130,28 @@
     source?.setData(data);
   }
 
+  /** Centre of the visible viewport, antimeridian-aware (lon in [-180, 180)). */
+  function viewportCenter(): Origin {
+    const { west, east, south, north, wraps } = viewportBounds();
+    const span = wraps ? east - west + 360 : east - west;
+    let lon = west + span / 2;
+    if (lon > 180) lon -= 360;
+    if (lon < -180) lon += 360;
+    return { lon, lat: (south + north) / 2 };
+  }
+
   async function downloadOsm() {
     if (!map) return;
     const zoom = map.getZoom();
     if (zoom < 12) { error = 'Zoom in to level 12 or closer before getting data (keeps the public API request small).'; return; }
     loading = true; error = ''; junctions = null; status = 'Getting OSM data from Overpass…';
     try {
-      const bounds = map.getBounds();
-      const [west, south] = [bounds.getWest(), bounds.getSouth()];
-      const [east, north] = [bounds.getEast(), bounds.getNorth()];
-      origin = { lon: (west + east) / 2, lat: (south + north) / 2 };
-      const query = `[out:json][timeout:60];way[highway](${south},${west},${north},${east});out body geom;`;
-      const response = await fetch(`${overpass}?data=${encodeURIComponent(query)}`);
-      if (!response.ok) throw new Error(`Overpass returned HTTP ${response.status}`);
-      roads = normalizeRoads(await response.json() as OsmResponse);
+      const { west, east, south, north, wraps } = viewportBounds();
+      origin = viewportCenter();
+      const osm = wraps
+        ? { elements: [...(await fetchOsmBox(south, west, north, 180)).elements, ...(await fetchOsmBox(south, -180, north, east)).elements] }
+        : await fetchOsmBox(south, west, north, east);
+      roads = normalizeRoads(osm);
       overtureArrowIpc = null;
       detectorCrs = 'local';
       hasRoadData = roads.length > 0;
@@ -122,14 +166,15 @@
     if (map.getZoom() < 12) { error = 'Zoom in to level 12 or closer before getting Overture data (keeps the GeoParquet query small).'; return; }
     loading = true; error = ''; junctions = null; status = 'Resolving Overture GeoParquet assets and starting DuckDB-WASM…';
     try {
-      const bounds = map.getBounds();
+      const { west, east, south, north, wraps } = viewportBounds();
+      origin = viewportCenter();
       const result = await loadOvertureRoads(
-        { west: bounds.getWest(), south: bounds.getSouth(), east: bounds.getEast(), north: bounds.getNorth() },
+        { west, south, east, north, wraps },
         (message) => { status = message; }
       );
       roads = [];
       overtureArrowIpc = result.arrowIpc;
-      detectorCrs = 'bng';
+      detectorCrs = result.crsProj;
       hasRoadData = result.count > 0;
       setSource('roads', result.roadGeoJson);
       status = `Loaded ${result.count.toLocaleString()} Overture road segments from ${result.release} via GeoParquet and DuckDB-WASM. Click Generate junctions.`;
@@ -138,7 +183,7 @@
   }
 
   function displayPoint(point: number[]): [number, number] {
-    return detectorCrs === 'bng' ? proj4('EPSG:27700', 'EPSG:4326', point) as [number, number] : unproject(point);
+    return detectorCrs === 'local' ? unproject(point) : proj4(detectorCrs, 'EPSG:4326', point) as [number, number];
   }
 
   async function generate() {
