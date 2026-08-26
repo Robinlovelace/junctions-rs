@@ -7,6 +7,7 @@
 use geo::line_intersection::{LineIntersection, line_intersection};
 use geo::{ConvexHull, Line, MultiPoint};
 use geo_types::{Coord, Point, Polygon};
+use rstar::{AABB, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -164,10 +165,53 @@ fn endpoint_candidates(roads: &[Road]) -> Vec<Candidate> {
     out
 }
 
+/// Bounding box of one road, used as the R-tree key for pair pruning.
+struct RoadEntry {
+    index: usize,
+    envelope: AABB<[f64; 2]>,
+}
+
+impl RTreeObject for RoadEntry {
+    type Envelope = AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        self.envelope
+    }
+}
+
+fn road_envelope(coordinates: &[[f64; 2]]) -> AABB<[f64; 2]> {
+    let mut min = [f64::INFINITY; 2];
+    let mut max = [f64::NEG_INFINITY; 2];
+    for coordinate in coordinates {
+        min[0] = min[0].min(coordinate[0]);
+        min[1] = min[1].min(coordinate[1]);
+        max[0] = max[0].max(coordinate[0]);
+        max[1] = max[1].max(coordinate[1]);
+    }
+    AABB::from_corners(min, max)
+}
+
 fn intersection_candidates(roads: &[Road]) -> Vec<Candidate> {
+    let entries: Vec<RoadEntry> = roads
+        .iter()
+        .enumerate()
+        .map(|(index, road)| RoadEntry {
+            index,
+            envelope: road_envelope(&road.coordinates),
+        })
+        .collect();
+    let tree: RTree<RoadEntry> = RTree::bulk_load(entries);
+
     let mut out = Vec::new();
     for (left_index, left) in roads.iter().enumerate() {
-        for (right_index, right) in roads.iter().enumerate().skip(left_index + 1) {
+        // Only visit each unordered pair once: neighbours with a strictly
+        // greater index (ties impossible — envelopes are unique per road).
+        for neighbour in tree.locate_in_envelope_intersecting(&road_envelope(&left.coordinates)) {
+            let right_index = neighbour.index;
+            if right_index <= left_index {
+                continue;
+            }
+            let right = &roads[right_index];
             if left.level != right.level {
                 continue;
             }
@@ -200,6 +244,22 @@ struct Cluster {
     roads: Vec<usize>,
 }
 
+/// R-tree key over every accepted candidate position, so a new candidate can
+/// find its cluster without scanning all clusters.
+struct ClusterEntry {
+    cluster_index: usize,
+    level: i32,
+    point: Coord<f64>,
+}
+
+impl RTreeObject for ClusterEntry {
+    type Envelope = AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        AABB::from_corners([self.point.x, self.point.y], [self.point.x, self.point.y])
+    }
+}
+
 fn cluster_candidates(mut candidates: Vec<Candidate>, distance: f64) -> Vec<Cluster> {
     candidates.sort_by(|a, b| {
         a.level
@@ -208,23 +268,45 @@ fn cluster_candidates(mut candidates: Vec<Candidate>, distance: f64) -> Vec<Clus
             .then_with(|| a.point.x.total_cmp(&b.point.x))
     });
     let mut clusters: Vec<Cluster> = Vec::new();
+    let mut entries: RTree<ClusterEntry> = RTree::new();
+    let tolerance = distance * distance + EPSILON;
     'candidate: for candidate in candidates {
-        for cluster in clusters
-            .iter_mut()
-            .filter(|cluster| cluster.level == candidate.level)
-        {
-            if cluster.points.iter().any(|point| {
-                squared_distance(*point, candidate.point) <= distance * distance + EPSILON
-            }) {
-                cluster.points.push(candidate.point);
-                cluster.roads.extend(candidate.roads);
-                continue 'candidate;
+        let query = AABB::from_corners(
+            [candidate.point.x - distance, candidate.point.y - distance],
+            [candidate.point.x + distance, candidate.point.y + distance],
+        );
+        // Collect before mutating: rstar iterators borrow the tree.
+        let mut target: Option<usize> = None;
+        for entry in entries.locate_in_envelope_intersecting(&query) {
+            if entry.level != candidate.level {
+                continue;
             }
+            if squared_distance(entry.point, candidate.point) > tolerance {
+                continue;
+            }
+            target = Some(entry.cluster_index);
+            break;
         }
+        if let Some(cluster_index) = target {
+            clusters[cluster_index].points.push(candidate.point);
+            clusters[cluster_index].roads.extend(candidate.roads);
+            entries.insert(ClusterEntry {
+                cluster_index,
+                level: candidate.level,
+                point: candidate.point,
+            });
+            continue 'candidate;
+        }
+        let cluster_index = clusters.len();
         clusters.push(Cluster {
             level: candidate.level,
             points: vec![candidate.point],
             roads: candidate.roads,
+        });
+        entries.insert(ClusterEntry {
+            cluster_index,
+            level: candidate.level,
+            point: candidate.point,
         });
     }
     clusters

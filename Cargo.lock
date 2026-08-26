@@ -465,6 +465,7 @@ version = "0.1.0"
 dependencies = [
  "geo",
  "geo-types",
+ "rstar 0.12.2",
  "serde",
  "serde_json",
  "thiserror",

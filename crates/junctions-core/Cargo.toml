@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 geo.workspace = true
 geo-types.workspace = true
+rstar = "0.12"
 serde.workspace = true
 thiserror.workspace = true
 
