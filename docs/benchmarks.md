@@ -34,6 +34,17 @@ A separate in-process, warm benchmark used a 200-road projected star with one sh
 
 That is **24.7× faster** for this narrow synthetic endpoint workload. It is not a geometry-equivalence claim: DuckDB uses GEOS buffers/dissolve/convex hull and supports its full macro policy; the Rust prototype emits a deterministic square-derived convex hull. The result proves the Rust core can outperform the current macro on a compatible hot path, not that it has replaced the production extension.
 
+## Scaling
+
+Candidate search is R-tree indexed (`rstar`), so interior-crossing detection no longer compares all road pairs. Measured on the Leeds Overture sets (`min_arms = 3`, release build):
+
+| Input | Segments | Wall time | Peak RSS | Junctions |
+|---|---:|---:|---:|---:|
+| Leeds 1 km | 3,403 | <0.1 s | ~40 MB | 891 |
+| Leeds 10 km | 81,923 | **1.04 s** | 352 MB | 25,975 |
+
+The 10 km workload was infeasible (>300 s) before indexing; outputs on the shared 1 km input are unchanged by the index.
+
 ## Real-data agreement (Leeds, 1 km)
 
 Both engines consumed the identical input: 3,403 Overture road segments around the University of Leeds, projected to EPSG:27700, with interior-crossing detection enabled on the Rust side (`min_arms = 3`).
